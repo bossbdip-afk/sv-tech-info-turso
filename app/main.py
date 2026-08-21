@@ -1,4 +1,4 @@
-import hashlib, json, os
+import hashlib, json, os, re
 from datetime import datetime, timezone
 
 import libsql
@@ -31,7 +31,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.2.0')
+app = FastAPI(title=APP_NAME, version='9.3.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -58,8 +58,14 @@ def clean_id(value):
 
 def turso_catalog(include_disabled=True):
     items = []
-    # Recommended setup: TURSO_DATABASE_1_URL ... TURSO_DATABASE_5_URL
-    for i in range(1, 21):
+    # Dynamic multi-database discovery. Add DB6, DB7, DB25, DB100... without code changes:
+    # TURSO_DATABASE_<N>_URL + TURSO_DATABASE_<N>_AUTH_TOKEN.
+    slots = set()
+    for key in os.environ:
+        m = re.fullmatch(r'TURSO_DATABASE_(\d+)_(?:URL|AUTH_TOKEN|ENABLED|NAME|ACCOUNT|ID)', key)
+        if m:
+            slots.add(int(m.group(1)))
+    for i in sorted(x for x in slots if x > 0):
         url = os.getenv(f'TURSO_DATABASE_{i}_URL','').strip()
         token = os.getenv(f'TURSO_DATABASE_{i}_AUTH_TOKEN','').strip()
         if not url or not token:
@@ -309,7 +315,7 @@ def turso_delete_records(database_id:str='', district:str='', upazila:str='', us
     finally: conn.close()
 
 @app.get('/public/search')
-def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str=''):
+def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str='', user=Depends(current_user)):
     district=district.strip(); upazila=upazila.strip()
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
     rows=[]; errors=[]
