@@ -1,0 +1,77 @@
+services:
+  - type: web
+    name: sv-tech-pdf-api
+    runtime: docker
+    plan: free
+    autoDeploy: false
+    healthCheckPath: /health
+    envVars:
+      # Existing Firebase credential is used ONLY to verify Admin login tokens.
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: MAX_PDF_MB
+        value: "40"
+
+      # Turso database slot 1
+      - key: TURSO_DATABASE_1_ID
+        value: "db1"
+      - key: TURSO_DATABASE_1_NAME
+        value: "Turso DB 1"
+      - key: TURSO_DATABASE_1_URL
+        sync: false
+      - key: TURSO_DATABASE_1_AUTH_TOKEN
+        sync: false
+      - key: TURSO_DATABASE_1_ENABLED
+        value: "true"
+
+      # Turso database slot 2
+      - key: TURSO_DATABASE_2_ID
+        value: "db2"
+      - key: TURSO_DATABASE_2_NAME
+        value: "Turso DB 2"
+      - key: TURSO_DATABASE_2_URL
+        sync: false
+      - key: TURSO_DATABASE_2_AUTH_TOKEN
+        sync: false
+      - key: TURSO_DATABASE_2_ENABLED
+        value: "true"
+
+      # Turso database slot 3
+      - key: TURSO_DATABASE_3_ID
+        value: "db3"
+      - key: TURSO_DATABASE_3_NAME
+        value: "Turso DB 3"
+      - key: TURSO_DATABASE_3_URL
+        sync: false
+      - key: TURSO_DATABASE_3_AUTH_TOKEN
+        sync: false
+      - key: TURSO_DATABASE_3_ENABLED
+        value: "true"
+
+      # Turso database slot 4
+      - key: TURSO_DATABASE_4_ID
+        value: "db4"
+      - key: TURSO_DATABASE_4_NAME
+        value: "Turso DB 4"
+      - key: TURSO_DATABASE_4_URL
+        sync: false
+      - key: TURSO_DATABASE_4_AUTH_TOKEN
+        sync: false
+      - key: TURSO_DATABASE_4_ENABLED
+        value: "true"
+
+      # Turso database slot 5
+      - key: TURSO_DATABASE_5_ID
+        value: "db5"
+      - key: TURSO_DATABASE_5_NAME
+        value: "Turso DB 5"
+      - key: TURSO_DATABASE_5_URL
+        sync: false
+      - key: TURSO_DATABASE_5_AUTH_TOKEN
+        sync: false
+      - key: TURSO_DATABASE_5_ENABLED
+        value: "true"
