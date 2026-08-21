@@ -31,7 +31,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.3.0')
+app = FastAPI(title=APP_NAME, version='9.5.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -62,7 +62,7 @@ def turso_catalog(include_disabled=True):
     # TURSO_DATABASE_<N>_URL + TURSO_DATABASE_<N>_AUTH_TOKEN.
     slots = set()
     for key in os.environ:
-        m = re.fullmatch(r'TURSO_DATABASE_(\d+)_(?:URL|AUTH_TOKEN|ENABLED|NAME|ACCOUNT|ID)', key)
+        m = re.fullmatch(r'TURSO_DATABASE_(\d+)_(?:URL|AUTH_TOKEN|ENABLED|NAME|ACCOUNT|ID|LIMIT_GB)', key)
         if m:
             slots.add(int(m.group(1)))
     for i in sorted(x for x in slots if x > 0):
@@ -262,13 +262,75 @@ def record_from_db(row):
 @app.get('/health')
 def health():
     configured = len(turso_catalog(include_disabled=True))
-    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.2-MULTI-TURSO-UPLOAD-COUNTS',
+    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.5-DYNAMIC-DB-USAGE',
             'database':'Turso/libSQL','configured_databases':configured,'multi_account_ready':True,'max_pdf_mb':MAX_PDF_MB,
             'firebase_usage':'admin_auth_only'}
 
 @app.get('/turso/list')
 def turso_list(user=Depends(current_user)):
     return {'ok':True,'databases':[{k:v for k,v in x.items() if k not in {'url','token'}} for x in turso_catalog(True)]}
+
+def _db_limit_gb(item):
+    slot = int(item.get('slot') or 1)
+    raw = os.getenv(f'TURSO_DATABASE_{slot}_LIMIT_GB', os.getenv('TURSO_DATABASE_LIMIT_GB', '5')).strip()
+    try:
+        value = float(raw)
+        return value if value > 0 else 5.0
+    except Exception:
+        return 5.0
+
+
+def _database_usage(item):
+    """Return a lightweight storage indicator for one Turso/libSQL database.
+
+    Primary method uses SQLite live pages: (page_count - freelist_count) * page_size.
+    Deleted/free pages therefore stop counting as used capacity when SQLite puts them
+    on the freelist. A content-size fallback is used if remote PRAGMA is unavailable.
+    The limit defaults to 5 GiB per configured DB and can be overridden with
+    TURSO_DATABASE_<N>_LIMIT_GB (or global TURSO_DATABASE_LIMIT_GB).
+    """
+    limit_gb = _db_limit_gb(item)
+    limit_bytes = max(1, int(limit_gb * 1024 * 1024 * 1024))
+    conn = connect_item(item)
+    try:
+        records = int(conn.execute('SELECT COUNT(*) FROM records').fetchone()[0])
+        method = 'sqlite_live_pages'
+        try:
+            page_size = int(conn.execute('PRAGMA page_size').fetchone()[0])
+            page_count = int(conn.execute('PRAGMA page_count').fetchone()[0])
+            free_pages = int(conn.execute('PRAGMA freelist_count').fetchone()[0])
+            live_pages = max(0, page_count - free_pages)
+            used_bytes = max(0, live_pages * page_size)
+            allocated_bytes = max(0, page_count * page_size)
+        except Exception:
+            method = 'live_content_estimate'
+            raw_bytes = int(conn.execute("SELECT COALESCE(SUM(LENGTH(data_json)+LENGTH(record_key)),0) FROM records").fetchone()[0] or 0)
+            # Allow practical headroom for table pages + indexes without pretending
+            # this is Turso's billing meter.
+            used_bytes = int(raw_bytes * 1.40)
+            allocated_bytes = used_bytes
+        percent = round(min(100.0, (used_bytes / limit_bytes) * 100.0), 3)
+        return {
+            'id': item['id'], 'name': item['name'], 'account': item.get('account',''),
+            'slot': item.get('slot'), 'enabled': item.get('enabled', True),
+            'records': records, 'used_bytes': used_bytes, 'allocated_bytes': allocated_bytes,
+            'limit_bytes': limit_bytes, 'limit_gb': limit_gb, 'usage_percent': percent,
+            'method': method,
+        }
+    finally:
+        conn.close()
+
+
+@app.get('/turso/usage-all')
+def turso_usage_all(user=Depends(current_user)):
+    databases=[]; errors=[]
+    for item in turso_catalog(True):
+        try:
+            databases.append(_database_usage(item))
+        except Exception as exc:
+            errors.append({'id':item['id'],'name':item['name'],'error':type(exc).__name__})
+    return {'ok':True,'databases':databases,'errors':errors,'default_limit_gb':float(os.getenv('TURSO_DATABASE_LIMIT_GB','5') or 5)}
+
 
 @app.get('/turso/stats-all')
 def turso_stats_all(user=Depends(current_user)):
