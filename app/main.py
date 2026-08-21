@@ -31,7 +31,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.0.0')
+app = FastAPI(title=APP_NAME, version='9.1.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -68,8 +68,9 @@ def turso_catalog(include_disabled=True):
         if not include_disabled and not enabled:
             continue
         name = os.getenv(f'TURSO_DATABASE_{i}_NAME', f'Turso DB {i}').strip() or f'Turso DB {i}'
+        account = os.getenv(f'TURSO_DATABASE_{i}_ACCOUNT', f'Turso Account {i}').strip() or f'Turso Account {i}'
         dbid = os.getenv(f'TURSO_DATABASE_{i}_ID', f'db{i}').strip() or f'db{i}'
-        items.append({'id': clean_id(dbid), 'name': name, 'url': url, 'token': token, 'enabled': enabled, 'slot': i})
+        items.append({'id': clean_id(dbid), 'name': name, 'account': account, 'url': url, 'token': token, 'enabled': enabled, 'slot': i})
     # Single-database compatibility.
     if not items:
         url = os.getenv('TURSO_DATABASE_URL','').strip()
@@ -190,7 +191,7 @@ def record_from_db(row):
 def health():
     configured = len(turso_catalog(include_disabled=True))
     return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9-MULTI-TURSO',
-            'database':'Turso/libSQL','configured_databases':configured,'max_pdf_mb':MAX_PDF_MB,
+            'database':'Turso/libSQL','configured_databases':configured,'multi_account_ready':True,'max_pdf_mb':MAX_PDF_MB,
             'firebase_usage':'admin_auth_only'}
 
 @app.get('/turso/list')
