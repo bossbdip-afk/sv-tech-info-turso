@@ -31,7 +31,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.1.0')
+app = FastAPI(title=APP_NAME, version='9.2.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -169,13 +169,79 @@ ON CONFLICT(record_key) DO UPDATE SET
  source_file=excluded.source_file,created_at=excluded.created_at,data_json=excluded.data_json'''
 
 
+def _comparable_record(row):
+    """Return stable record content for upload-result comparison.
+
+    Parser/import metadata changes on every upload (notably created_at) and must not
+    turn an otherwise identical voter record into an "updated" record.
+    """
+    r = dict(row or {})
+    for key in ('created_at', 'record_key', 'source_file'):
+        r.pop(key, None)
+    return r
+
+
 def write_rows(rows, item):
     conn = connect_item(item)
     try:
-        # sqlite-compatible DB-API; executemany keeps the upload far cheaper than one network commit per row.
-        conn.executemany(UPSERT_SQL, [row_params(r) for r in rows])
-        conn.commit()
-        return len(rows), 1
+        # Classify incoming rows before the UPSERT so the Admin Panel can report
+        # exact new / updated / unchanged counts instead of showing 0 for all.
+        params_by_key = {}
+        row_by_key = {}
+        duplicate_keys = 0
+        for row in rows:
+            params = row_params(row)
+            key = params[0]
+            if key in row_by_key:
+                duplicate_keys += 1
+            row_by_key[key] = row
+            params_by_key[key] = params
+
+        keys = list(row_by_key)
+        existing = {}
+        # Keep well below SQLite's host-parameter limit and avoid one remote read
+        # per record.
+        for start in range(0, len(keys), 200):
+            chunk = keys[start:start + 200]
+            if not chunk:
+                continue
+            marks = ','.join('?' for _ in chunk)
+            sql = f'SELECT record_key,data_json FROM records WHERE record_key IN ({marks})'
+            for record_key, data_json in conn.execute(sql, chunk).fetchall():
+                try:
+                    existing[str(record_key)] = json.loads(data_json or '{}')
+                except Exception:
+                    existing[str(record_key)] = {}
+
+        added = updated = unchanged = 0
+        to_write = []
+        for key in keys:
+            incoming = row_by_key[key]
+            previous = existing.get(key)
+            if previous is None:
+                added += 1
+                to_write.append(params_by_key[key])
+            elif _comparable_record(previous) == _comparable_record(incoming):
+                unchanged += 1
+            else:
+                updated += 1
+                to_write.append(params_by_key[key])
+
+        if to_write:
+            # sqlite-compatible DB-API; executemany keeps the upload far cheaper
+            # than one network commit per row. Unchanged rows are not rewritten.
+            conn.executemany(UPSERT_SQL, to_write)
+            conn.commit()
+
+        return {
+            'records_added': added,
+            'records_updated': updated,
+            'records_unchanged': unchanged,
+            'records_skipped': 0,
+            'duplicate_input_keys': duplicate_keys,
+            'records_written': added + updated,
+            'batch_commits': 1 if to_write else 0,
+        }
     finally:
         conn.close()
 
@@ -190,7 +256,7 @@ def record_from_db(row):
 @app.get('/health')
 def health():
     configured = len(turso_catalog(include_disabled=True))
-    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9-MULTI-TURSO',
+    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.2-MULTI-TURSO-UPLOAD-COUNTS',
             'database':'Turso/libSQL','configured_databases':configured,'multi_account_ready':True,'max_pdf_mb':MAX_PDF_MB,
             'firebase_usage':'admin_auth_only'}
 
@@ -289,14 +355,20 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
     except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
     item=get_target(database_id)
-    try: written,batches=write_rows(rows,item)
+    try: write_result=write_rows(rows,item)
     except Exception as e: raise HTTPException(500,f'Turso write failed: {type(e).__name__}: {e}') from e
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
     now=datetime.now(timezone.utc).isoformat()
+    written=int(write_result['records_written'])
     log={'database_id':item['id'],'database_name':item['name'],'district_name':district.strip(),'upazila_name':upazila.strip(),
-         'file_name':file.filename,'records_detected':len(rows),'records_written':written,'batch_commits':batches,
-         'records_added_or_updated':written,'raw_preserved':raw,'created_at':now,'uploaded_by':user.get('email',''),
-         'parser':'PY-RENDER-V9-MULTI-TURSO'}
+         'file_name':file.filename,'records_detected':len(rows),'records_written':written,
+         'batch_commits':write_result['batch_commits'],
+         'records_added':write_result['records_added'],'records_updated':write_result['records_updated'],
+         'records_unchanged':write_result['records_unchanged'],'records_skipped':write_result['records_skipped'],
+         'duplicate_input_keys':write_result['duplicate_input_keys'],
+         'records_added_or_updated':write_result['records_added']+write_result['records_updated'],
+         'raw_preserved':raw,'created_at':now,'uploaded_by':user.get('email',''),
+         'parser':'PY-RENDER-V9.2-MULTI-TURSO-UPLOAD-COUNTS'}
     conn=connect_item(item)
     try:
         iid='import_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
