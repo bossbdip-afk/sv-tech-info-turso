@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: sv-tech-pdf-api
+    name: sv-tech-info-turso
     runtime: docker
     plan: free
     autoDeploy: false
@@ -14,13 +14,15 @@ services:
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: MAX_PDF_MB
-        value: "40"
+        value: "100"
 
       # Turso database slot 1
       - key: TURSO_DATABASE_1_ID
         value: "db1"
       - key: TURSO_DATABASE_1_NAME
         value: "Turso DB 1"
+      - key: TURSO_DATABASE_1_ACCOUNT
+        value: "Turso Account 1"
       - key: TURSO_DATABASE_1_URL
         sync: false
       - key: TURSO_DATABASE_1_AUTH_TOKEN
@@ -33,6 +35,8 @@ services:
         value: "db2"
       - key: TURSO_DATABASE_2_NAME
         value: "Turso DB 2"
+      - key: TURSO_DATABASE_2_ACCOUNT
+        value: "Turso Account 2"
       - key: TURSO_DATABASE_2_URL
         sync: false
       - key: TURSO_DATABASE_2_AUTH_TOKEN
@@ -45,6 +49,8 @@ services:
         value: "db3"
       - key: TURSO_DATABASE_3_NAME
         value: "Turso DB 3"
+      - key: TURSO_DATABASE_3_ACCOUNT
+        value: "Turso Account 3"
       - key: TURSO_DATABASE_3_URL
         sync: false
       - key: TURSO_DATABASE_3_AUTH_TOKEN
@@ -57,6 +63,8 @@ services:
         value: "db4"
       - key: TURSO_DATABASE_4_NAME
         value: "Turso DB 4"
+      - key: TURSO_DATABASE_4_ACCOUNT
+        value: "Turso Account 4"
       - key: TURSO_DATABASE_4_URL
         sync: false
       - key: TURSO_DATABASE_4_AUTH_TOKEN
@@ -69,6 +77,8 @@ services:
         value: "db5"
       - key: TURSO_DATABASE_5_NAME
         value: "Turso DB 5"
+      - key: TURSO_DATABASE_5_ACCOUNT
+        value: "Turso Account 5"
       - key: TURSO_DATABASE_5_URL
         sync: false
       - key: TURSO_DATABASE_5_AUTH_TOKEN
