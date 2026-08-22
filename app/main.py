@@ -58,10 +58,11 @@ AREA_ROUTE_TTL = int(os.getenv('AREA_ROUTE_TTL_SECONDS', '3600'))
 _SEARCH_CACHE = {}
 _AREA_DB_CACHE = {}
 _SEARCH_LOCK = threading.Lock()
-_SEARCH_LOCAL = threading.local()
 _SEARCH_POOL = ThreadPoolExecutor(max_workers=max(2, int(os.getenv('SEARCH_WORKERS', '8'))))
 _SCHEMA_READY = set()
 _SCHEMA_LOCK = threading.Lock()
+_AREA_WARM_DONE = threading.Event()
+_AREA_WARM_STARTED = threading.Event()
 
 def _clean_search_part(v):
     return re.sub(r'\s+', ' ', str(v or '').strip()).casefold()
@@ -105,22 +106,45 @@ def _area_route_note(district, upazila, database_id):
             if k.startswith(key[0]+'|'+key[1]+'|'):
                 _SEARCH_CACHE.pop(k,None)
 
-def _thread_search_conn(item):
-    conns=getattr(_SEARCH_LOCAL,'conns',None)
-    if conns is None:
-        conns={}; _SEARCH_LOCAL.conns=conns
-    dbid=str(item['id'])
-    conn=conns.get(dbid)
-    if conn is None:
-        conn=connect_item(item, ensure=False); conns[dbid]=conn
-    return conn
+def _prewarm_area_routes():
+    """Build area -> database routing in background after each Render restart.
 
-def _drop_thread_search_conn(item):
-    conns=getattr(_SEARCH_LOCAL,'conns',None) or {}
-    conn=conns.pop(str(item['id']),None)
-    if conn is not None:
-        try: conn.close()
-        except Exception: pass
+    This removes the main latency regression: a cold process previously had an
+    empty in-memory route cache, so every first search hit every Turso database
+    and waited for the slowest one.  Distinct areas are much cheaper to read and
+    are warmed once per process.
+    """
+    if _AREA_WARM_STARTED.is_set():
+        return
+    _AREA_WARM_STARTED.set()
+    items=turso_catalog(False)
+    def scan(item):
+        conn=None
+        try:
+            conn=connect_item(item, ensure=False)
+            rows=conn.execute("SELECT DISTINCT district_name, upazila_name FROM records WHERE district_name<>'' AND upazila_name<>''").fetchall()
+            return item, rows, None
+        except Exception as exc:
+            return item, [], type(exc).__name__
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
+    try:
+        futures=[_SEARCH_POOL.submit(scan,item) for item in items]
+        for fut in as_completed(futures):
+            item, rows, err=fut.result()
+            if err:
+                continue
+            for district, upazila in rows:
+                _area_route_note(str(district or ''), str(upazila or ''), item['id'])
+    finally:
+        _AREA_WARM_DONE.set()
+
+def _start_area_prewarm():
+    t=threading.Thread(target=_prewarm_area_routes, name='area-route-prewarm', daemon=True)
+    t.start()
+
 ADMIN_EMAILS = {x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
 SKIP_AUTH = os.getenv('SKIP_AUTH', '').lower() in {'1','true','yes'}
 
@@ -141,10 +165,15 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.8.0')
+app = FastAPI(title=APP_NAME, version='9.9.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
+
+@app.on_event('startup')
+def _startup_area_route_prewarm():
+    # Non-blocking: Render can become healthy immediately while the tiny area map warms.
+    _start_area_prewarm()
 
 async def current_user(authorization: str | None = Header(default=None)):
     if SKIP_AUTH:
@@ -406,7 +435,7 @@ def record_from_db(row):
 @app.get('/health')
 def health():
     configured = len(turso_catalog(include_disabled=True))
-    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.8-FAST-SEARCH-UPLOAD',
+    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.9-FAST-ROUTED-SEARCH',
             'database':'Turso/libSQL','configured_databases':configured,'multi_account_ready':True,'max_pdf_mb':MAX_PDF_MB,
             'firebase_usage':'admin_auth_only'}
 
@@ -532,9 +561,20 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
 
     all_items=turso_catalog(False)
     route_ids=_area_route_get(district,upazila)
+    route_source='memory' if route_ids else 'cold'
+
+    # On a very early request, give the background prewarm a short chance to finish.
+    # This is bounded and avoids waiting seconds on all DBs when the route map is almost ready.
+    if route_ids is None and _AREA_WARM_STARTED.is_set() and not _AREA_WARM_DONE.is_set():
+        _AREA_WARM_DONE.wait(timeout=float(os.getenv('AREA_ROUTE_WAIT_SECONDS','0.8')))
+        route_ids=_area_route_get(district,upazila)
+        if route_ids:
+            route_source='startup-warm'
+
     items=[x for x in all_items if route_ids is None or str(x['id']) in route_ids]
     if not items and route_ids is not None:
-        items=all_items
+        # Safety fallback: never lose results because of a stale route map.
+        items=all_items; route_source='fallback-all'
 
     def search_one(item):
         sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
@@ -542,17 +582,21 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             if val:
                 sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
         sql += ' LIMIT 500'
-        for attempt in range(2):
-            try:
-                conn=_thread_search_conn(item)
-                found=[]
-                for raw in conn.execute(sql,args).fetchall():
-                    d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
-                return found, None
-            except Exception as exc:
-                _drop_thread_search_conn(item)
-                if attempt==1:
-                    return [], {'database_id':item['id'],'error':type(exc).__name__}
+        conn=None
+        try:
+            # Fresh short-lived connections are more reliable than keeping remote libSQL
+            # connections pinned to worker threads across Render idle/restart periods.
+            conn=connect_item(item, ensure=False)
+            found=[]
+            for raw in conn.execute(sql,args).fetchall():
+                d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
+            return found, None
+        except Exception as exc:
+            return [], {'database_id':item['id'],'error':type(exc).__name__}
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
 
     rows=[]; errors=[]
     futures=[_SEARCH_POOL.submit(search_one,item) for item in items]
@@ -564,7 +608,14 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     for d in rows:
         key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','birth_date','district_name','upazila_name'))
         if key not in uniq: uniq[key]=d
-    payload={'ok':True,'count':len(uniq),'results':list(uniq.values()),'errors':errors,'cache_hit':False,'databases_queried':len(items),'search_ms':round((time.perf_counter()-started)*1000,1)}
+    # Any database that returned this area becomes a verified route immediately.
+    for d in rows:
+        dbid=d.get('_database_id')
+        if dbid:
+            _area_route_note(district,upazila,dbid)
+    payload={'ok':True,'count':len(uniq),'results':list(uniq.values()),'errors':errors,'cache_hit':False,
+             'databases_queried':len(items),'route_source':route_source,
+             'search_ms':round((time.perf_counter()-started)*1000,1)}
     _search_cache_put(cache_key,payload)
     return payload
 
