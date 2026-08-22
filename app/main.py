@@ -1,4 +1,5 @@
 import hashlib, json, os, re, time, threading
+import urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -141,7 +142,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.10.0')
+app = FastAPI(title=APP_NAME, version='9.11.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -406,7 +407,7 @@ def record_from_db(row):
 @app.get('/health')
 def health():
     configured = len(turso_catalog(include_disabled=True))
-    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.10-V97-SEARCH-RESTORE',
+    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.11-BOUNDED-HTTP-SEARCH',
             'database':'Turso/libSQL','configured_databases':configured,'multi_account_ready':True,'max_pdf_mb':MAX_PDF_MB,
             'firebase_usage':'admin_auth_only'}
 
@@ -525,43 +526,84 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     district=district.strip(); upazila=upazila.strip()
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
     items=turso_catalog(False)
+    started=time.monotonic()
+
+    # One search query is a single round-trip, so Turso's HTTP protocol is a
+    # better fit than opening a remote SDK connection for every database.  Most
+    # importantly, urllib gives us a real socket timeout: a slow/unreachable DB
+    # can no longer hold the whole endpoint for 1-2 minutes.
+    per_db_timeout=max(1.0, min(float(os.getenv('SEARCH_DB_TIMEOUT_SECONDS','8')), 20.0))
+
+    def http_url(item):
+        url=str(item.get('url') or '').strip().rstrip('/')
+        if url.startswith('libsql://'):
+            url='https://'+url[len('libsql://'):]
+        elif url.startswith('turso://'):
+            url='https://'+url[len('turso://'):]
+        elif url.startswith('http://') or url.startswith('https://'):
+            pass
+        else:
+            url='https://'+url
+        return url+'/v2/pipeline'
+
+    def text_arg(value):
+        return {'type':'text','value':str(value)}
 
     def search_one(item):
-        conn=None
+        db_started=time.monotonic()
         try:
-            conn=connect_item(item, ensure=False)
             sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
             for col,val in [('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]:
                 val=val.strip()
                 if val:
                     sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
             sql += ' LIMIT 500'
+            payload=json.dumps({'requests':[
+                {'type':'execute','stmt':{'sql':sql,'args':[text_arg(x) for x in args]}},
+                {'type':'close'}
+            ]}, ensure_ascii=False).encode('utf-8')
+            req=urllib.request.Request(
+                http_url(item), data=payload, method='POST',
+                headers={'Authorization':'Bearer '+str(item['token']), 'Content-Type':'application/json'}
+            )
+            with urllib.request.urlopen(req, timeout=per_db_timeout) as resp:
+                body=json.loads(resp.read().decode('utf-8'))
+            result0=(body.get('results') or [{}])[0]
+            if result0.get('type')!='ok':
+                err=result0.get('error') or {}
+                raise RuntimeError(str(err.get('message') or 'Turso query failed'))
+            result=((result0.get('response') or {}).get('result') or {})
             found=[]
-            for raw in conn.execute(sql,args).fetchall():
-                d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
-            return found, None
+            for row in result.get('rows') or []:
+                cell=row[0] if row else None
+                raw=cell.get('value') if isinstance(cell,dict) else cell
+                d=record_from_db((raw,)); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
+            return found, None, int((time.monotonic()-db_started)*1000)
         except Exception as exc:
-            return [], {'database_id':item['id'],'error':type(exc).__name__}
-        finally:
-            if conn is not None:
-                try: conn.close()
-                except Exception: pass
+            return [], {'database_id':item['id'],'error':type(exc).__name__}, int((time.monotonic()-db_started)*1000)
 
-    rows=[]; errors=[]
-    # V9.7 proven search path: query independent Turso DBs concurrently with
-    # short-lived connections and no routing/prewarm/stale-connection layer.
+    rows=[]; errors=[]; timings={}
+    # Each worker has a hard network timeout, so waiting for all workers is now
+    # bounded instead of being controlled by the slowest libSQL connection.
     workers=max(1,min(len(items),5))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures=[pool.submit(search_one,item) for item in items]
-        for fut in as_completed(futures):
-            found,err=fut.result(); rows.extend(found)
+        future_map={pool.submit(search_one,item):item for item in items}
+        for fut in as_completed(future_map):
+            item=future_map[fut]
+            try:
+                found,err,elapsed=fut.result()
+            except Exception as exc:
+                found=[]; err={'database_id':item['id'],'error':type(exc).__name__}; elapsed=int((time.monotonic()-started)*1000)
+            rows.extend(found); timings[str(item['id'])]=elapsed
             if err: errors.append(err)
 
     uniq={}
     for d in rows:
         key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','birth_date','district_name','upazila_name'))
         if key not in uniq: uniq[key]=d
-    return {'ok':True,'count':len(uniq),'results':list(uniq.values()),'errors':errors}
+    return {'ok':True,'count':len(uniq),'results':list(uniq.values()),'errors':errors,
+            'search_ms':int((time.monotonic()-started)*1000),'database_ms':timings,
+            'database_timeout_seconds':per_db_timeout}
 
 async def read_pdf(file:UploadFile):
     data=await file.read()
