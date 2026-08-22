@@ -1,4 +1,4 @@
-import hashlib, json, os, re
+import hashlib, json, os, re, time
 from datetime import datetime, timezone
 
 import libsql
@@ -11,6 +11,42 @@ from .parser import parse_pdf_bytes
 
 APP_NAME = 'SV Tech Multi-Turso PDF Backend'
 MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
+
+# Preview -> upload usually happens immediately with the same PDF.  Cache parsed
+# rows briefly so upload does not parse every PDF a second time.  The cache is
+# best-effort only: a cold restart or another worker simply falls back to parsing.
+PREVIEW_CACHE_TTL = int(os.getenv('PREVIEW_CACHE_TTL_SECONDS', '900'))
+PREVIEW_CACHE_MAX = int(os.getenv('PREVIEW_CACHE_MAX_ITEMS', '6'))
+_PREVIEW_CACHE = {}
+
+def _parse_cache_key(data: bytes, district: str, upazila: str) -> str:
+    h = hashlib.sha256()
+    h.update(data)
+    h.update(b'\0')
+    h.update(district.strip().encode('utf-8'))
+    h.update(b'\0')
+    h.update(upazila.strip().encode('utf-8'))
+    return h.hexdigest()
+
+def _cache_put(key: str, rows):
+    now = time.time()
+    # Drop stale entries first.
+    for k, item in list(_PREVIEW_CACHE.items()):
+        if now - float(item.get('ts', 0)) > PREVIEW_CACHE_TTL:
+            _PREVIEW_CACHE.pop(k, None)
+    if len(_PREVIEW_CACHE) >= PREVIEW_CACHE_MAX:
+        oldest = min(_PREVIEW_CACHE, key=lambda k: _PREVIEW_CACHE[k].get('ts', 0))
+        _PREVIEW_CACHE.pop(oldest, None)
+    _PREVIEW_CACHE[key] = {'ts': now, 'rows': rows}
+
+def _cache_get(key: str):
+    item = _PREVIEW_CACHE.get(key)
+    if not item:
+        return None
+    if time.time() - float(item.get('ts', 0)) > PREVIEW_CACHE_TTL:
+        _PREVIEW_CACHE.pop(key, None)
+        return None
+    return item.get('rows')
 ADMIN_EMAILS = {x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
 SKIP_AUTH = os.getenv('SKIP_AUTH', '').lower() in {'1','true','yes'}
 
@@ -31,7 +67,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.5.0')
+app = FastAPI(title=APP_NAME, version='9.6.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -207,8 +243,8 @@ def write_rows(rows, item):
         existing = {}
         # Keep well below SQLite's host-parameter limit and avoid one remote read
         # per record.
-        for start in range(0, len(keys), 200):
-            chunk = keys[start:start + 200]
+        for start in range(0, len(keys), 800):
+            chunk = keys[start:start + 800]
             if not chunk:
                 continue
             marks = ','.join('?' for _ in chunk)
@@ -410,17 +446,26 @@ async def read_pdf(file:UploadFile):
 @app.post('/preview')
 async def preview(district:str=Form(...),upazila:str=Form(...),file:UploadFile=File(...),user=Depends(current_user)):
     data=await read_pdf(file)
-    try: rows=parse_pdf_bytes(data,district.strip(),upazila.strip(),file.filename)
+    district = district.strip(); upazila = upazila.strip()
+    cache_key = _parse_cache_key(data, district, upazila)
+    try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
     except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
+    _cache_put(cache_key, rows)
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
-    return {'ok':True,'records_detected':len(rows),'raw_preserved':raw,'preview':rows[:20],'parser':'PY-RENDER-V9-MULTI-TURSO'}
+    return {'ok':True,'records_detected':len(rows),'raw_preserved':raw,'preview':rows[:20],
+            'parser':'PY-RENDER-V9.6-WARD-UNICODE-FIX','upload_cache_ready':True}
 
 @app.post('/upload')
 async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Form(''),file:UploadFile=File(...),user=Depends(current_user)):
     data=await read_pdf(file)
-    try: rows=parse_pdf_bytes(data,district.strip(),upazila.strip(),file.filename)
-    except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
+    district = district.strip(); upazila = upazila.strip()
+    cache_key = _parse_cache_key(data, district, upazila)
+    rows = _cache_get(cache_key)
+    cache_hit = rows is not None
+    if rows is None:
+        try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
+        except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
     item=get_target(database_id)
     try: write_result=write_rows(rows,item)
@@ -428,7 +473,7 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
     now=datetime.now(timezone.utc).isoformat()
     written=int(write_result['records_written'])
-    log={'database_id':item['id'],'database_name':item['name'],'district_name':district.strip(),'upazila_name':upazila.strip(),
+    log={'database_id':item['id'],'database_name':item['name'],'district_name':district,'upazila_name':upazila,
          'file_name':file.filename,'records_detected':len(rows),'records_written':written,
          'batch_commits':write_result['batch_commits'],
          'records_added':write_result['records_added'],'records_updated':write_result['records_updated'],
@@ -436,12 +481,13 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
          'duplicate_input_keys':write_result['duplicate_input_keys'],
          'records_added_or_updated':write_result['records_added']+write_result['records_updated'],
          'raw_preserved':raw,'created_at':now,'uploaded_by':user.get('email',''),
-         'parser':'PY-RENDER-V9.2-MULTI-TURSO-UPLOAD-COUNTS'}
+         'preview_cache_hit':cache_hit,
+         'parser':'PY-RENDER-V9.6-WARD-UNICODE-UPLOAD-FAST'}
     conn=connect_item(item)
     try:
         iid='import_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
         conn.execute('INSERT INTO pdf_imports(id,database_id,district_name,upazila_name,file_name,records_detected,records_written,created_at,uploaded_by,parser) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                     (iid,item['id'],district.strip(),upazila.strip(),file.filename,len(rows),written,now,user.get('email',''),log['parser']))
+                     (iid,item['id'],district,upazila,file.filename,len(rows),written,now,user.get('email',''),log['parser']))
         conn.commit()
     finally: conn.close()
     return {'ok':True,**log}

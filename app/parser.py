@@ -68,6 +68,12 @@ def clean_unicode_bangla(s: str) -> str:
     x = re.sub(r'\s*,\s*,+', ', ', x)
     x = re.sub(r'(^|\s)[,;]+\s*', r'\1', x)
     x = re.sub(r'\s+([।,:;])', r'\1', x)
+    # Some legacy Bengali PDFs emit the nukta after a vowel sign, e.g.
+    # 'জাযে়দা' / 'বাডি়'. Unicode display order requires the nukta
+    # immediately after the base consonant: 'জায়েদা' / 'বাড়ি'.
+    # Normalize this before any field-level validation or database write.
+    x = re.sub(r'([ডঢয])([ািীুূৃেৈোৌ])়', r'\1়\2', x)
+    x = unicodedata.normalize('NFC', x)
     return clean(x)
 
 def _reorder_prebase(x: str) -> str:
@@ -226,6 +232,29 @@ def detect_anchors(rows: List[Row]):
                     anchors.append({'serial': serial, 'x': it.x, 'y': row.y})
     return anchors
 
+def _extract_ward_no(raw_text: str, repaired_text: str = '') -> str:
+    """Extract ward number from both legacy and repaired page-header text.
+
+    Voter-list PDFs are inconsistent: examples include 'ওয়াডÎ নং-০৪',
+    'ওয়ার্ড নং ০৪', and 'ওয়ার্ড নম্বর ... : ০৪'.  Keep this logic in one
+    place and never let a blank secondary ward label overwrite a valid value.
+    """
+    candidates = [str(raw_text or ''), str(repaired_text or '')]
+    patterns = [
+        r'ওয়াড\s*Î?\s*(?:নং|ন(?:ń|ং)?র|নম্বর)\s*(?:\([^)]*\))?\s*(?:[-–—:]|：)?\s*([0-9০-৯]{1,3})',
+        r'ওয়ার্ড\s*(?:নং|নম্বর)\s*(?:\([^)]*\))?\s*(?:[-–—:]|：)?\s*([0-9০-৯]{1,3})',
+        r'ওয়ার্ড\s*(?:নং|নম্বর)\s*(?:\([^)]*\))?\s*(?:[-–—:]|：)?\s*([0-9০-৯]{1,3})',
+    ]
+    for src in candidates:
+        for pat in patterns:
+            m = re.search(pat, src, re.I)
+            if m:
+                value = clean(m.group(1))
+                if value:
+                    return value
+    return ''
+
+
 def extract_meta(rows: List[Row], anchors, prev: Dict[str, str]):
     if not anchors:
         return dict(prev)
@@ -233,12 +262,16 @@ def extract_meta(rows: List[Row], anchors, prev: Dict[str, str]):
     header_rows = [r for r in rows if r.y < first_y - 2]
     raw_header = ' '.join(r.text for r in header_rows)
     header = repair_bangla(raw_header)
+    # A few PDFs place part of the page metadata on the same visual row as the
+    # first record anchor.  Keep a full-page fallback for metadata only.
+    raw_page_text = ' '.join(r.text for r in rows)
+    page_text = repair_bangla(raw_page_text)
     meta = dict(prev)
 
     def pick(pattern, src=header):
         m = re.search(pattern, src, re.I)
         return clean(m.group(1)) if m else ''
-    raw_ward = re.search(r'ওয়াড\s*Î?\s*(?:নং|ন(?:ń|ং)?র)\s*(?:[-–—:]|：)?\s*([0-9০-৯]{1,2})', raw_header, re.I)
+    ward_value = _extract_ward_no(raw_header, header) or _extract_ward_no(raw_page_text, page_text)
     raw_post = re.search(r'Ï?পা.{0,4}েকাড\s*[:：]\s*([0-9০-৯]{4})', raw_header, re.I)
     meta['district_name'] = pick(r'জেলা\s*[:：]\s*(.*?)\s+(?=উপজেলা|ইউনিয়ন|ডাকঘর|ভোটার)') or meta.get('district_name', '')
     meta['upazila_name'] = pick(r'উপজেলা(?:/থানা)?\s*[:：]\s*(.*?)\s+(?=ইউনিয়ন|ডাকঘর|ভোটার)') or meta.get('upazila_name', '')
@@ -247,7 +280,7 @@ def extract_meta(rows: List[Row], anchors, prev: Dict[str, str]):
     meta['post_code'] = (clean(raw_post.group(1)) if raw_post else '') or pick(r'পোস্ট\s*কোড\s*[:：]\s*([0-9০-৯]+)') or meta.get('post_code', '')
     meta['voter_area_code'] = pick(r'ভোটার\s*এলাকার\s*(?:নং|নম্বর|কোড)\s*[:：]\s*([0-9০-৯]+)') or meta.get('voter_area_code', '')
     meta['voter_area'] = pick(r'ভোটার\s*এলাকার\s*নাম\s*[:：]\s*(.*?)(?=\s+ভোটার\s*এলাকার|$)') or meta.get('voter_area', '')
-    meta['ward_no'] = (clean(raw_ward.group(1)) if raw_ward else '') or pick(r'ওয়ার্ড\s*(?:নম্বর|নং)\s*(?:\([^)]*\))?\s*(?:[-–—:]|：)?\s*([0-9০-৯]+)') or meta.get('ward_no', '')
+    meta['ward_no'] = ward_value or meta.get('ward_no', '')
     return meta
 
 
@@ -288,7 +321,11 @@ def _field(text: str, pattern: str) -> str:
 
 def _suspicious(v: str) -> bool:
     s = str(v or '')
-    return bool(re.search(r'[\x80-\x9FĥĔėƣŘƃƁĤſŌƀËõøĢĺĴÐŇĨ×ÎÙêēęĽłăŞűįĦƆƂŽÑũûîŮýħåıéūůżŅ]', s) or re.search(r'তািরখ|উপেজলা|ইউিনয়ন|ভাটার|ি[পঠজ]তা|িঠকানা|Ï|Ð', s))
+    return bool(
+        re.search(r'[\x80-\x9FĥĔėƣŘƃƁĤſŌƀËõøĢĺĴÐŇĨ×ÎÙêēęĽłăŞűįĦƆƂŽÑũûîŮýħåıéūůżŅ]', s)
+        or re.search(r'তািরখ|উপেজলা|ইউিনয়ন|ভাটার|ি[পঠজ]তা|িঠকানা|Ï|Ð', s)
+        or re.search(r'[ডঢয][ািীুূৃেৈোৌ]়', s)
+    )
 
 def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, carry_meta: Dict[str, str], page_no: int):
     rows = get_rows(page)
@@ -347,7 +384,7 @@ def parse_page(page: fitz.Page, district: str, upazila: str, file_name: str, car
             'union_name': meta.get('union_name', ''), 'post_office': meta.get('post_office', ''), 'post_code': meta.get('post_code', ''),
             'voter_area': meta.get('voter_area', ''), 'voter_area_code': meta.get('voter_area_code', ''), 'ward_no': meta.get('ward_no', ''),
             'source_file': file_name, 'created_at': datetime.now(timezone.utc).isoformat(),
-            'parser_version': 'PY-RENDER-V5-FATHER-UNICODE-FIXED', 'text_encoding': 'unicode-bn-server-v1',
+            'parser_version': 'PY-RENDER-V9.6-WARD-UNICODE-FIX', 'text_encoding': 'unicode-bn-server-v1',
             'raw_pdf_text': raw_cell, 'parser_source_text': ctext,
         }
         row['raw_name'] = row['name']
