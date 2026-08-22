@@ -1,4 +1,5 @@
 import hashlib, json, os, re, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import libsql
@@ -67,7 +68,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.6.0')
+app = FastAPI(title=APP_NAME, version='9.7.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -138,9 +139,13 @@ def get_target(database_id=''):
     return item
 
 
-def connect_item(item):
+def connect_item(item, ensure=True):
     conn = libsql.connect(database=item['url'], auth_token=item['token'])
-    ensure_schema(conn)
+    # Public search is latency-sensitive and only reads databases that have
+    # already been initialized by upload/admin operations. Avoid repeating
+    # remote CREATE TABLE/INDEX checks on every search request.
+    if ensure:
+        ensure_schema(conn)
     return conn
 
 
@@ -173,6 +178,10 @@ def ensure_schema(conn):
     conn.execute('CREATE INDEX IF NOT EXISTS idx_records_father ON records(father_name)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_records_mother ON records(mother_name)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_records_dob ON records(birth_date)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_records_area_name ON records(district_name, upazila_name, name)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_records_area_father ON records(district_name, upazila_name, father_name)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_records_area_mother ON records(district_name, upazila_name, mother_name)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_records_area_dob ON records(district_name, upazila_name, birth_date)')
     conn.execute('''CREATE TABLE IF NOT EXISTS pdf_imports (
         id TEXT PRIMARY KEY, database_id TEXT, district_name TEXT, upazila_name TEXT,
         file_name TEXT, records_detected INTEGER, records_written INTEGER,
@@ -416,21 +425,39 @@ def turso_delete_records(database_id:str='', district:str='', upazila:str='', us
 def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str='', user=Depends(current_user)):
     district=district.strip(); upazila=upazila.strip()
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
-    rows=[]; errors=[]
-    for item in turso_catalog(False):
+    items=turso_catalog(False)
+
+    def search_one(item):
+        conn=None
         try:
-            conn=connect_item(item)
+            conn=connect_item(item, ensure=False)
             sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
             for col,val in [('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]:
                 val=val.strip()
                 if val:
                     sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
             sql += ' LIMIT 500'
+            found=[]
             for raw in conn.execute(sql,args).fetchall():
-                d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; rows.append(d)
-            conn.close()
+                d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
+            return found, None
         except Exception as exc:
-            errors.append({'database_id':item['id'],'error':type(exc).__name__})
+            return [], {'database_id':item['id'],'error':type(exc).__name__}
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
+
+    rows=[]; errors=[]
+    # Turso accounts are independent remote databases. Query them concurrently so
+    # total search latency is close to the slowest DB instead of the sum of all DBs.
+    workers=max(1,min(len(items),5))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures=[pool.submit(search_one,item) for item in items]
+        for fut in as_completed(futures):
+            found,err=fut.result(); rows.extend(found)
+            if err: errors.append(err)
+
     uniq={}
     for d in rows:
         key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','birth_date','district_name','upazila_name'))
