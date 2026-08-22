@@ -1,4 +1,4 @@
-import hashlib, json, os, re, time
+import hashlib, json, os, re, time, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -48,6 +48,79 @@ def _cache_get(key: str):
         _PREVIEW_CACHE.pop(key, None)
         return None
     return item.get('rows')
+
+# Warm-search acceleration. Render commonly keeps one process alive for many
+# requests, so reusing worker threads and their read-only Turso connections
+# avoids paying connection setup on every search.
+SEARCH_CACHE_TTL = int(os.getenv('SEARCH_CACHE_TTL_SECONDS', '120'))
+SEARCH_CACHE_MAX = int(os.getenv('SEARCH_CACHE_MAX_ITEMS', '256'))
+AREA_ROUTE_TTL = int(os.getenv('AREA_ROUTE_TTL_SECONDS', '3600'))
+_SEARCH_CACHE = {}
+_AREA_DB_CACHE = {}
+_SEARCH_LOCK = threading.Lock()
+_SEARCH_LOCAL = threading.local()
+_SEARCH_POOL = ThreadPoolExecutor(max_workers=max(2, int(os.getenv('SEARCH_WORKERS', '8'))))
+_SCHEMA_READY = set()
+_SCHEMA_LOCK = threading.Lock()
+
+def _clean_search_part(v):
+    return re.sub(r'\s+', ' ', str(v or '').strip()).casefold()
+
+def _search_cache_key(district, upazila, name, father, mother, dob):
+    return '|'.join(_clean_search_part(x) for x in (district, upazila, name, father, mother, dob))
+
+def _search_cache_get(key):
+    now=time.time()
+    with _SEARCH_LOCK:
+        item=_SEARCH_CACHE.get(key)
+        if not item: return None
+        if now-item['ts']>SEARCH_CACHE_TTL:
+            _SEARCH_CACHE.pop(key,None); return None
+        return item['value']
+
+def _search_cache_put(key, value):
+    now=time.time()
+    with _SEARCH_LOCK:
+        _SEARCH_CACHE[key]={'ts':now,'value':value}
+        if len(_SEARCH_CACHE)>SEARCH_CACHE_MAX:
+            oldest=min(_SEARCH_CACHE,key=lambda k:_SEARCH_CACHE[k]['ts'])
+            _SEARCH_CACHE.pop(oldest,None)
+
+def _area_route_get(district, upazila):
+    key=(_clean_search_part(district),_clean_search_part(upazila)); now=time.time()
+    with _SEARCH_LOCK:
+        item=_AREA_DB_CACHE.get(key)
+        if not item: return None
+        if now-item['ts']>AREA_ROUTE_TTL:
+            _AREA_DB_CACHE.pop(key,None); return None
+        return set(item['ids'])
+
+def _area_route_note(district, upazila, database_id):
+    key=(_clean_search_part(district),_clean_search_part(upazila)); now=time.time()
+    with _SEARCH_LOCK:
+        item=_AREA_DB_CACHE.setdefault(key,{'ts':now,'ids':set()})
+        item['ts']=now; item['ids'].add(str(database_id))
+        # Any write to this area may change prior cached search results.
+        for k in list(_SEARCH_CACHE):
+            if k.startswith(key[0]+'|'+key[1]+'|'):
+                _SEARCH_CACHE.pop(k,None)
+
+def _thread_search_conn(item):
+    conns=getattr(_SEARCH_LOCAL,'conns',None)
+    if conns is None:
+        conns={}; _SEARCH_LOCAL.conns=conns
+    dbid=str(item['id'])
+    conn=conns.get(dbid)
+    if conn is None:
+        conn=connect_item(item, ensure=False); conns[dbid]=conn
+    return conn
+
+def _drop_thread_search_conn(item):
+    conns=getattr(_SEARCH_LOCAL,'conns',None) or {}
+    conn=conns.pop(str(item['id']),None)
+    if conn is not None:
+        try: conn.close()
+        except Exception: pass
 ADMIN_EMAILS = {x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
 SKIP_AUTH = os.getenv('SKIP_AUTH', '').lower() in {'1','true','yes'}
 
@@ -68,7 +141,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.7.0')
+app = FastAPI(title=APP_NAME, version='9.8.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -141,11 +214,16 @@ def get_target(database_id=''):
 
 def connect_item(item, ensure=True):
     conn = libsql.connect(database=item['url'], auth_token=item['token'])
-    # Public search is latency-sensitive and only reads databases that have
-    # already been initialized by upload/admin operations. Avoid repeating
-    # remote CREATE TABLE/INDEX checks on every search request.
-    if ensure:
-        ensure_schema(conn)
+    # CREATE TABLE/INDEX IF NOT EXISTS is safe but expensive over a remote DB.
+    # Ensure once per database per warm process, not on every upload/log write.
+    if ensure and str(item['id']) not in _SCHEMA_READY:
+        with _SCHEMA_LOCK:
+            if str(item['id']) not in _SCHEMA_READY:
+                try:
+                    conn.execute('SELECT 1 FROM records LIMIT 1').fetchone()
+                except Exception:
+                    ensure_schema(conn)
+                _SCHEMA_READY.add(str(item['id']))
     return conn
 
 
@@ -232,6 +310,25 @@ def _comparable_record(row):
     return r
 
 
+def _bulk_upsert(conn, params_rows, batch_size=25):
+    """Send many records per SQL statement instead of one remote execute per row."""
+    if not params_rows: return 0
+    columns = ('record_key','voter_no','serial_no','name','father_name','mother_name','profession','birth_date','district_name','upazila_name','address','union_name','post_office','post_code','voter_area','voter_area_code','ward_no','source_file','created_at','data_json')
+    update = ('voter_no=excluded.voter_no,serial_no=excluded.serial_no,name=excluded.name,father_name=excluded.father_name,'
+              'mother_name=excluded.mother_name,profession=excluded.profession,birth_date=excluded.birth_date,'
+              'district_name=excluded.district_name,upazila_name=excluded.upazila_name,address=excluded.address,'
+              'union_name=excluded.union_name,post_office=excluded.post_office,post_code=excluded.post_code,'
+              'voter_area=excluded.voter_area,voter_area_code=excluded.voter_area_code,ward_no=excluded.ward_no,'
+              'source_file=excluded.source_file,created_at=excluded.created_at,data_json=excluded.data_json')
+    batches=0
+    one='('+','.join('?' for _ in columns)+')'
+    for start in range(0,len(params_rows),batch_size):
+        chunk=params_rows[start:start+batch_size]
+        sql='INSERT INTO records ('+','.join(columns)+') VALUES '+','.join(one for _ in chunk)+' ON CONFLICT(record_key) DO UPDATE SET '+update
+        flat=[value for row in chunk for value in row]
+        conn.execute(sql,flat); batches+=1
+    return batches
+
 def write_rows(rows, item):
     conn = connect_item(item)
     try:
@@ -278,10 +375,11 @@ def write_rows(rows, item):
                 updated += 1
                 to_write.append(params_by_key[key])
 
+        write_batches=0
         if to_write:
-            # sqlite-compatible DB-API; executemany keeps the upload far cheaper
-            # than one network commit per row. Unchanged rows are not rewritten.
-            conn.executemany(UPSERT_SQL, to_write)
+            # Multi-row UPSERT cuts remote Turso round-trips dramatically versus
+            # DB-API executemany on large voter PDFs. One commit keeps it atomic.
+            write_batches=_bulk_upsert(conn,to_write)
             conn.commit()
 
         return {
@@ -292,6 +390,7 @@ def write_rows(rows, item):
             'duplicate_input_keys': duplicate_keys,
             'records_written': added + updated,
             'batch_commits': 1 if to_write else 0,
+            'write_batches': write_batches,
         }
     finally:
         conn.close()
@@ -307,7 +406,7 @@ def record_from_db(row):
 @app.get('/health')
 def health():
     configured = len(turso_catalog(include_disabled=True))
-    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.5-DYNAMIC-DB-USAGE',
+    return {'ok':True,'service':APP_NAME,'parser':'PY-RENDER-V9.8-FAST-SEARCH-UPLOAD',
             'database':'Turso/libSQL','configured_databases':configured,'multi_account_ready':True,'max_pdf_mb':MAX_PDF_MB,
             'firebase_usage':'admin_auth_only'}
 
@@ -423,46 +522,51 @@ def turso_delete_records(database_id:str='', district:str='', upazila:str='', us
 
 @app.get('/public/search')
 def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str='', user=Depends(current_user)):
-    district=district.strip(); upazila=upazila.strip()
+    district=district.strip(); upazila=upazila.strip(); name=name.strip(); father=father.strip(); mother=mother.strip(); dob=dob.strip()
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
-    items=turso_catalog(False)
+    started=time.perf_counter()
+    cache_key=_search_cache_key(district,upazila,name,father,mother,dob)
+    cached=_search_cache_get(cache_key)
+    if cached is not None:
+        return {**cached,'cache_hit':True,'search_ms':round((time.perf_counter()-started)*1000,1)}
+
+    all_items=turso_catalog(False)
+    route_ids=_area_route_get(district,upazila)
+    items=[x for x in all_items if route_ids is None or str(x['id']) in route_ids]
+    if not items and route_ids is not None:
+        items=all_items
 
     def search_one(item):
-        conn=None
-        try:
-            conn=connect_item(item, ensure=False)
-            sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
-            for col,val in [('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]:
-                val=val.strip()
-                if val:
-                    sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
-            sql += ' LIMIT 500'
-            found=[]
-            for raw in conn.execute(sql,args).fetchall():
-                d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
-            return found, None
-        except Exception as exc:
-            return [], {'database_id':item['id'],'error':type(exc).__name__}
-        finally:
-            if conn is not None:
-                try: conn.close()
-                except Exception: pass
+        sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
+        for col,val in [('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]:
+            if val:
+                sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
+        sql += ' LIMIT 500'
+        for attempt in range(2):
+            try:
+                conn=_thread_search_conn(item)
+                found=[]
+                for raw in conn.execute(sql,args).fetchall():
+                    d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
+                return found, None
+            except Exception as exc:
+                _drop_thread_search_conn(item)
+                if attempt==1:
+                    return [], {'database_id':item['id'],'error':type(exc).__name__}
 
     rows=[]; errors=[]
-    # Turso accounts are independent remote databases. Query them concurrently so
-    # total search latency is close to the slowest DB instead of the sum of all DBs.
-    workers=max(1,min(len(items),5))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures=[pool.submit(search_one,item) for item in items]
-        for fut in as_completed(futures):
-            found,err=fut.result(); rows.extend(found)
-            if err: errors.append(err)
+    futures=[_SEARCH_POOL.submit(search_one,item) for item in items]
+    for fut in as_completed(futures):
+        found,err=fut.result(); rows.extend(found)
+        if err: errors.append(err)
 
     uniq={}
     for d in rows:
         key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','birth_date','district_name','upazila_name'))
         if key not in uniq: uniq[key]=d
-    return {'ok':True,'count':len(uniq),'results':list(uniq.values()),'errors':errors}
+    payload={'ok':True,'count':len(uniq),'results':list(uniq.values()),'errors':errors,'cache_hit':False,'databases_queried':len(items),'search_ms':round((time.perf_counter()-started)*1000,1)}
+    _search_cache_put(cache_key,payload)
+    return payload
 
 async def read_pdf(file:UploadFile):
     data=await file.read()
@@ -481,18 +585,29 @@ async def preview(district:str=Form(...),upazila:str=Form(...),file:UploadFile=F
     _cache_put(cache_key, rows)
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
     return {'ok':True,'records_detected':len(rows),'raw_preserved':raw,'preview':rows[:20],
-            'parser':'PY-RENDER-V9.6-WARD-UNICODE-FIX','upload_cache_ready':True}
+            'parser':'PY-RENDER-V9.8-WARD-UNICODE-FAST','upload_cache_ready':True,'preview_token':cache_key}
 
 @app.post('/upload')
-async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Form(''),file:UploadFile=File(...),user=Depends(current_user)):
-    data=await read_pdf(file)
-    district = district.strip(); upazila = upazila.strip()
-    cache_key = _parse_cache_key(data, district, upazila)
-    rows = _cache_get(cache_key)
+async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Form(''),preview_token:str=Form(''),file_name:str=Form(''),file:UploadFile|None=File(None),user=Depends(current_user)):
+    district = district.strip(); upazila = upazila.strip(); preview_token=preview_token.strip()
+    rows = _cache_get(preview_token) if preview_token else None
     cache_hit = rows is not None
+    source_name=(file_name or (file.filename if file else '') or 'upload.pdf').strip()
+    if rows is not None:
+        first=rows[0] if rows else {}
+        if str(first.get('district_name','')).strip()!=district or str(first.get('upazila_name','')).strip()!=upazila:
+            rows=None; cache_hit=False
     if rows is None:
-        try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
-        except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
+        if file is None:
+            raise HTTPException(409,'Preview cache মেয়াদ শেষ হয়েছে। PDF আবার পাঠাতে হবে।')
+        data=await read_pdf(file)
+        cache_key = _parse_cache_key(data, district, upazila)
+        rows = _cache_get(cache_key)
+        cache_hit = rows is not None
+        if rows is None:
+            try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
+            except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
+        source_name=file.filename or source_name
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
     item=get_target(database_id)
     try: write_result=write_rows(rows,item)
@@ -501,20 +616,21 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
     now=datetime.now(timezone.utc).isoformat()
     written=int(write_result['records_written'])
     log={'database_id':item['id'],'database_name':item['name'],'district_name':district,'upazila_name':upazila,
-         'file_name':file.filename,'records_detected':len(rows),'records_written':written,
-         'batch_commits':write_result['batch_commits'],
+         'file_name':source_name,'records_detected':len(rows),'records_written':written,
+         'batch_commits':write_result['batch_commits'],'write_batches':write_result.get('write_batches',0),
          'records_added':write_result['records_added'],'records_updated':write_result['records_updated'],
          'records_unchanged':write_result['records_unchanged'],'records_skipped':write_result['records_skipped'],
          'duplicate_input_keys':write_result['duplicate_input_keys'],
          'records_added_or_updated':write_result['records_added']+write_result['records_updated'],
          'raw_preserved':raw,'created_at':now,'uploaded_by':user.get('email',''),
          'preview_cache_hit':cache_hit,
-         'parser':'PY-RENDER-V9.6-WARD-UNICODE-UPLOAD-FAST'}
-    conn=connect_item(item)
+         'parser':'PY-RENDER-V9.8-WARD-UNICODE-UPLOAD-FAST'}
+    _area_route_note(district,upazila,item['id'])
+    conn=connect_item(item, ensure=False)
     try:
         iid='import_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
         conn.execute('INSERT INTO pdf_imports(id,database_id,district_name,upazila_name,file_name,records_detected,records_written,created_at,uploaded_by,parser) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                     (iid,item['id'],district,upazila,file.filename,len(rows),written,now,user.get('email',''),log['parser']))
+                     (iid,item['id'],district,upazila,source_name,len(rows),written,now,user.get('email',''),log['parser']))
         conn.commit()
     finally: conn.close()
     return {'ok':True,**log}
