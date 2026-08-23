@@ -29,6 +29,16 @@ _AREA_ROUTE_CACHE = {}
 _AREA_ROUTE_LOCK = Lock()
 _AREA_ROUTE_READY = False
 
+# Name-only substring search index. A small FTS5 trigram index stores only the
+# name column, so searches such as "সুমন" can find "মোহাম্মদ সুমন" without
+# scanning every voter row in the area. The index is warmed in the background
+# and maintained by SQLite triggers; the legacy LIKE path remains a correctness
+# fallback if a database does not support FTS5/trigram.
+_NAME_FTS_READY = set()
+_NAME_FTS_FAILED = set()
+_NAME_FTS_LOCK = Lock()
+NAME_FTS_VERSION = 'name-trigram-v1'
+
 # Dashboard/storage metrics cache. Remote Turso databases are queried in parallel,
 # then the aggregate is kept briefly in memory. Stale cached data is returned
 # immediately while a daemon thread refreshes it in the background.
@@ -94,6 +104,74 @@ def _start_route_cache_builder():
     except Exception:
         pass
 
+def _name_fts_is_ready(database_id: str) -> bool:
+    with _NAME_FTS_LOCK:
+        return str(database_id) in _NAME_FTS_READY
+
+def _ensure_name_search_index(item):
+    """Create/backfill the search-only trigram index once per Turso DB.
+
+    This never changes voter data. Triggers keep the name index synchronized
+    with future INSERT/UPDATE/DELETE operations without changing upload code.
+    """
+    dbid = str(item.get('id', ''))
+    with _NAME_FTS_LOCK:
+        if dbid in _NAME_FTS_READY:
+            return True
+        if dbid in _NAME_FTS_FAILED:
+            return False
+    conn = None
+    try:
+        conn = connect_item(item, ensure=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS search_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')")
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_name_fts USING fts5(name, tokenize='trigram')")
+        conn.execute('''CREATE TRIGGER IF NOT EXISTS records_name_fts_ai AFTER INSERT ON records BEGIN
+            INSERT INTO records_name_fts(rowid,name) VALUES (new.rowid,COALESCE(new.name,''));
+        END''')
+        conn.execute('''CREATE TRIGGER IF NOT EXISTS records_name_fts_ad AFTER DELETE ON records BEGIN
+            DELETE FROM records_name_fts WHERE rowid=old.rowid;
+        END''')
+        conn.execute('''CREATE TRIGGER IF NOT EXISTS records_name_fts_au AFTER UPDATE ON records BEGIN
+            DELETE FROM records_name_fts WHERE rowid=old.rowid;
+            INSERT INTO records_name_fts(rowid,name) VALUES (new.rowid,COALESCE(new.name,''));
+        END''')
+        marker = conn.execute("SELECT value FROM search_index_meta WHERE key=?", (NAME_FTS_VERSION,)).fetchone()
+        if not marker:
+            # One-time backfill for records that existed before this version.
+            conn.execute('DELETE FROM records_name_fts')
+            conn.execute("INSERT INTO records_name_fts(rowid,name) SELECT rowid,COALESCE(name,'') FROM records")
+            conn.execute("INSERT OR REPLACE INTO search_index_meta(key,value) VALUES (?,?)",
+                         (NAME_FTS_VERSION, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        with _NAME_FTS_LOCK:
+            _NAME_FTS_READY.add(dbid)
+            _NAME_FTS_FAILED.discard(dbid)
+        return True
+    except Exception:
+        # Do not make public search depend on optional FTS support. The caller
+        # will use the complete legacy LIKE scan for this database instead.
+        with _NAME_FTS_LOCK:
+            _NAME_FTS_FAILED.add(dbid)
+        return False
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
+
+def _rebuild_name_search_indexes():
+    items = turso_catalog(False)
+    if not items:
+        return
+    # Keep startup/network pressure modest; index construction is server-side.
+    with ThreadPoolExecutor(max_workers=max(1, min(len(items), 2))) as pool:
+        list(pool.map(_ensure_name_search_index, items))
+
+def _start_name_search_index_builder():
+    try:
+        Thread(target=_rebuild_name_search_indexes, name='name-search-index', daemon=True).start()
+    except Exception:
+        pass
+
 def _parse_cache_key(data: bytes, district: str, upazila: str) -> str:
     h = hashlib.sha256()
     h.update(data)
@@ -152,6 +230,7 @@ def _warm_background_caches():
     # Do not block Railway startup. Warm search routing plus dashboard/storage
     # metrics in daemon threads so the first admin page load is usually instant.
     _start_route_cache_builder()
+    _start_name_search_index_builder()
     _start_metrics_refresh('stats')
     _start_metrics_refresh('usage')
 
@@ -655,19 +734,43 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     primary_items=routed_items or all_items
     filters=[('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]
     detail_count=sum(1 for _,v in filters if v)
+    name_only = bool(name) and detail_count == 1
 
     def search_one(item, exact=True):
         conn=None
         try:
             conn=connect_item(item, ensure=False)
-            sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
-            for col,val in filters:
-                if not val: continue
-                if exact:
-                    sql += f' AND {col}=?'; args.append(val)
-                else:
-                    sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
-            sql += ' LIMIT 500'
+            # Name-only is the expensive case. Prefer the trigram index so a
+            # contains lookup does not scan the whole district/upazila. FTS is
+            # only useful for 3+ character terms; shorter input safely falls
+            # back to the complete legacy LIKE query.
+            if name_only and len(name) >= 3 and _name_fts_is_ready(item['id']):
+                phrase='"'+name.replace('\"','\"\"')+'"'
+                sql='''SELECT r.data_json
+                       FROM records_name_fts AS f
+                       JOIN records AS r ON r.rowid=f.rowid
+                       WHERE f.name MATCH ?
+                         AND r.district_name=? AND r.upazila_name=?
+                         AND instr(r.name,?)>0
+                       ORDER BY CASE
+                           WHEN r.name=? THEN 0
+                           WHEN instr(r.name,?)=1 THEN 1
+                           ELSE 2
+                       END, r.name'''
+                args=[phrase,district,upazila,name,name,name]
+            else:
+                sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
+                for col,val in filters:
+                    if not val: continue
+                    if exact:
+                        sql += f' AND {col}=?'; args.append(val)
+                    else:
+                        sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
+                # Preserve the historical cap everywhere except name-only.
+                # Nickname searches must not silently omit valid matches just
+                # because there are more than 500 of them.
+                if exact or not name_only:
+                    sql += ' LIMIT 500'
             found=[]
             for raw in conn.execute(sql,args).fetchall():
                 d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
@@ -736,20 +839,24 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                         'search_mode':'route_fallback_exact','route_cache_hit':True,
                         'databases_queried':len(all_items)}
 
-    # Partial searches retain V9.6 compatibility. Use routed DBs first; only when
-    # they produce no match do we fan out to every DB.
+    # Partial searches retain V9.6 compatibility. Name-only can use the trigram
+    # index, while father/mother/DOB partial searches keep their existing logic.
     exact = False if detail_count else True
     result,errors=aggregate(primary_items,exact)
     if result:
+        mode = ('routed_name_trigram' if name_only and all(_name_fts_is_ready(x['id']) for x in primary_items)
+                else ('routed_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area')))
         return {'ok':True,'count':len(result),'results':result,'errors':errors,
-                'search_mode':'routed_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area'),
+                'search_mode':mode,
                 'route_cache_hit':bool(routed_items),'databases_queried':len(primary_items)}
     if routed_items and len(routed_items) < len(all_items):
         result2,errors2=aggregate(all_items,exact)
         errors.extend(errors2)
         result=result2
+    mode = ('name_trigram' if name_only and all(_name_fts_is_ready(x['id']) for x in (all_items if routed_items else primary_items))
+            else ('route_fallback_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area')))
     return {'ok':True,'count':len(result),'results':result,'errors':errors,
-            'search_mode':'route_fallback_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area'),
+            'search_mode':mode,
             'route_cache_hit':bool(routed_items),'databases_queried':len(all_items) if routed_items else len(primary_items)}
 
 async def read_pdf(file:UploadFile):
