@@ -188,21 +188,18 @@ def get_rows(page: fitz.Page) -> List[Row]:
                 x0, y0, x1, y1 = span.get('bbox', (0, 0, 0, 0))
                 items.append(Item(text=text, x=float(x0), y=(float(y0)+float(y1))/2, width=float(x1)-float(x0)))
     items.sort(key=lambda z: (z.y, z.x))
+    # Items are already sorted by y. Group against only the current visual row
+    # instead of scanning every previous row (the old code was O(n^2) per page).
+    # The same 2.5pt tolerance and running-average row y are preserved.
     rows: List[Tuple[float, List[Item]]] = []
     for item in items:
-        found = None
-        for idx, (ry, ritems) in enumerate(rows):
-            if abs(ry - item.y) < 2.5:
-                found = idx
-                break
-        if found is None:
-            rows.append((item.y, [item]))
-        else:
-            ry, ritems = rows[found]
+        if rows and abs(rows[-1][0] - item.y) < 2.5:
+            ry, ritems = rows[-1]
             count = len(ritems)
             ritems.append(item)
-            rows[found] = ((ry * count + item.y) / (count + 1), ritems)
-    rows.sort(key=lambda t: t[0])
+            rows[-1] = ((ry * count + item.y) / (count + 1), ritems)
+        else:
+            rows.append((item.y, [item]))
     result = []
     for ry, ritems in rows:
         txt = line_text(ritems)

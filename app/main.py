@@ -365,9 +365,25 @@ def write_rows(rows, item, import_meta=None):
                 to_write.append(params_by_key[key])
 
         if to_write:
-            # sqlite-compatible DB-API; executemany keeps the upload far cheaper
-            # than one network commit per row. Unchanged rows are not rewritten.
-            conn.executemany(UPSERT_SQL, to_write)
+            # libSQL is remote here. DB-API executemany may still issue many remote
+            # statements, which is very expensive for an 800+ row PDF. Send true
+            # multi-row INSERTs instead. 40 rows x 20 columns = 800 parameters,
+            # safely below SQLite's conservative 999-variable limit.
+            columns = ('record_key,voter_no,serial_no,name,father_name,mother_name,profession,birth_date,'
+                       'district_name,upazila_name,address,union_name,post_office,post_code,voter_area,'
+                       'voter_area_code,ward_no,source_file,created_at,data_json')
+            update_sql = '''ON CONFLICT(record_key) DO UPDATE SET
+ voter_no=excluded.voter_no,serial_no=excluded.serial_no,name=excluded.name,father_name=excluded.father_name,
+ mother_name=excluded.mother_name,profession=excluded.profession,birth_date=excluded.birth_date,
+ district_name=excluded.district_name,upazila_name=excluded.upazila_name,address=excluded.address,
+ union_name=excluded.union_name,post_office=excluded.post_office,post_code=excluded.post_code,
+ voter_area=excluded.voter_area,voter_area_code=excluded.voter_area_code,ward_no=excluded.ward_no,
+ source_file=excluded.source_file,created_at=excluded.created_at,data_json=excluded.data_json'''
+            for start in range(0, len(to_write), 40):
+                batch = to_write[start:start + 40]
+                values_sql = ','.join(['(' + ','.join(['?'] * 20) + ')'] * len(batch))
+                flat = [value for params in batch for value in params]
+                conn.execute(f'INSERT INTO records ({columns}) VALUES {values_sql} {update_sql}', flat)
 
         # Keep the import audit row in the SAME connection/transaction as the
         # record write. This removes a second Turso connection + schema check +
