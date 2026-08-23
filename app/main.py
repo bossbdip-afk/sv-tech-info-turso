@@ -39,6 +39,19 @@ _NAME_FTS_FAILED = set()
 _NAME_FTS_LOCK = Lock()
 NAME_FTS_VERSION = 'name-trigram-v1'
 
+# Search-only trigram index for father name, mother name, and birth date.
+# It is kept separate from the voter table and maintained by triggers so
+# single-field parent/DOB searches do not scan every row in an area.
+_AUX_FTS_READY = set()
+_AUX_FTS_FAILED = set()
+_AUX_FTS_LOCK = Lock()
+AUX_FTS_VERSION = 'parent-dob-trigram-v1'
+
+_BN_DIGITS = '০১২৩৪৫৬৭৮৯'
+_ASCII_DIGITS = '0123456789'
+_BN_TO_ASCII = str.maketrans(_BN_DIGITS, _ASCII_DIGITS)
+_ASCII_TO_BN = str.maketrans(_ASCII_DIGITS, _BN_DIGITS)
+
 # Dashboard/storage metrics cache. Remote Turso databases are queried in parallel,
 # then the aggregate is kept briefly in memory. Stale cached data is returned
 # immediately while a daemon thread refreshes it in the background.
@@ -108,6 +121,63 @@ def _name_fts_is_ready(database_id: str) -> bool:
     with _NAME_FTS_LOCK:
         return str(database_id) in _NAME_FTS_READY
 
+def _aux_fts_is_ready(database_id: str) -> bool:
+    with _AUX_FTS_LOCK:
+        return str(database_id) in _AUX_FTS_READY
+
+def _ascii_digits(value: str) -> str:
+    return str(value or '').translate(_BN_TO_ASCII)
+
+def _parse_dob_query(value: str):
+    """Return (year, canonical YYYY-MM-DD or ''). Accept common DOB formats."""
+    raw=_ascii_digits(value).strip()
+    if not raw:
+        return '', ''
+    if re.fullmatch(r'(?:19|20)\d{2}', raw):
+        return raw, ''
+    parts=re.findall(r'\d+', raw)
+    y=m=d=None
+    if len(parts)==3:
+        if len(parts[0])==4:
+            y,m,d=parts
+        elif len(parts[2])==4:
+            d,m,y=parts
+    elif len(parts)==1 and len(parts[0])==8:
+        digits=parts[0]
+        if re.fullmatch(r'(?:19|20)\d{6}', digits):
+            y,m,d=digits[:4],digits[4:6],digits[6:8]
+        elif re.fullmatch(r'\d{4}(?:19|20)\d{2}', digits):
+            d,m,y=digits[:2],digits[2:4],digits[4:8]
+    if y and m and d:
+        try:
+            dt=datetime(int(y),int(m),int(d))
+            return f'{dt.year:04d}', f'{dt.year:04d}-{dt.month:02d}-{dt.day:02d}'
+        except Exception:
+            pass
+    # Even if the full date is malformed/unknown, a visible 4-digit year can
+    # still narrow the FTS candidate set before the compatibility fallback.
+    year_match=re.search(r'(?<!\d)(?:19|20)\d{2}(?!\d)', raw)
+    return (year_match.group(0) if year_match else ''), ''
+
+def _dob_matches(stored: str, query: str) -> bool:
+    qyear,qcanon=_parse_dob_query(query)
+    syear,scanon=_parse_dob_query(stored)
+    if qcanon:
+        if scanon:
+            return scanon == qcanon
+        return _ascii_digits(query).strip() in _ascii_digits(stored).strip()
+    if qyear:
+        return syear == qyear or qyear in _ascii_digits(stored)
+    return _ascii_digits(query).strip() in _ascii_digits(stored).strip()
+
+def _fts_year_query(year: str) -> str:
+    terms=[]
+    for term in (year, str(year).translate(_ASCII_TO_BN)):
+        term=str(term or '').strip()
+        if term and term not in terms:
+            terms.append(term)
+    return ' OR '.join('"'+x.replace('"','""')+'"' for x in terms)
+
 def _ensure_name_search_index(item):
     """Create/backfill the search-only trigram index once per Turso DB.
 
@@ -158,13 +228,61 @@ def _ensure_name_search_index(item):
             try: conn.close()
             except Exception: pass
 
+def _ensure_aux_search_index(item):
+    """Create/backfill the parent-name and DOB trigram index once per DB."""
+    dbid=str(item.get('id',''))
+    with _AUX_FTS_LOCK:
+        if dbid in _AUX_FTS_READY:
+            return True
+        if dbid in _AUX_FTS_FAILED:
+            return False
+    conn=None
+    try:
+        conn=connect_item(item, ensure=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS search_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')")
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_aux_fts USING fts5(father_name,mother_name,birth_date, tokenize='trigram')")
+        conn.execute('''CREATE TRIGGER IF NOT EXISTS records_aux_fts_ai AFTER INSERT ON records BEGIN
+            INSERT INTO records_aux_fts(rowid,father_name,mother_name,birth_date)
+            VALUES (new.rowid,COALESCE(new.father_name,''),COALESCE(new.mother_name,''),COALESCE(new.birth_date,''));
+        END''')
+        conn.execute('''CREATE TRIGGER IF NOT EXISTS records_aux_fts_ad AFTER DELETE ON records BEGIN
+            DELETE FROM records_aux_fts WHERE rowid=old.rowid;
+        END''')
+        conn.execute('''CREATE TRIGGER IF NOT EXISTS records_aux_fts_au AFTER UPDATE ON records BEGIN
+            DELETE FROM records_aux_fts WHERE rowid=old.rowid;
+            INSERT INTO records_aux_fts(rowid,father_name,mother_name,birth_date)
+            VALUES (new.rowid,COALESCE(new.father_name,''),COALESCE(new.mother_name,''),COALESCE(new.birth_date,''));
+        END''')
+        marker=conn.execute("SELECT value FROM search_index_meta WHERE key=?", (AUX_FTS_VERSION,)).fetchone()
+        if not marker:
+            conn.execute('DELETE FROM records_aux_fts')
+            conn.execute("INSERT INTO records_aux_fts(rowid,father_name,mother_name,birth_date) SELECT rowid,COALESCE(father_name,''),COALESCE(mother_name,''),COALESCE(birth_date,'') FROM records")
+            conn.execute("INSERT OR REPLACE INTO search_index_meta(key,value) VALUES (?,?)",
+                         (AUX_FTS_VERSION, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        with _AUX_FTS_LOCK:
+            _AUX_FTS_READY.add(dbid)
+            _AUX_FTS_FAILED.discard(dbid)
+        return True
+    except Exception:
+        with _AUX_FTS_LOCK:
+            _AUX_FTS_FAILED.add(dbid)
+        return False
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
+
 def _rebuild_name_search_indexes():
     items = turso_catalog(False)
     if not items:
         return
     # Keep startup/network pressure modest; index construction is server-side.
+    def build(item):
+        _ensure_name_search_index(item)
+        _ensure_aux_search_index(item)
     with ThreadPoolExecutor(max_workers=max(1, min(len(items), 2))) as pool:
-        list(pool.map(_ensure_name_search_index, items))
+        list(pool.map(build, items))
 
 def _start_name_search_index_builder():
     try:
@@ -735,6 +853,9 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     filters=[('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]
     detail_count=sum(1 for _,v in filters if v)
     name_only = bool(name) and detail_count == 1
+    father_only = bool(father) and detail_count == 1
+    mother_only = bool(mother) and detail_count == 1
+    dob_only = bool(dob) and detail_count == 1
 
     def search_one(item, exact=True):
         conn=None
@@ -744,6 +865,7 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             # contains lookup does not scan the whole district/upazila. FTS is
             # only useful for 3+ character terms; shorter input safely falls
             # back to the complete legacy LIKE query.
+            post_filter_dob=False
             if name_only and len(name) >= 3 and _name_fts_is_ready(item['id']):
                 phrase='"'+name.replace('\"','\"\"')+'"'
                 sql='''SELECT r.data_json
@@ -758,6 +880,47 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                            ELSE 2
                        END, r.name'''
                 args=[phrase,district,upazila,name,name,name]
+            elif father_only and len(father) >= 3 and _aux_fts_is_ready(item['id']):
+                phrase='"'+father.replace('\"','\"\"')+'"'
+                sql='''SELECT r.data_json
+                       FROM records_aux_fts AS f
+                       JOIN records AS r ON r.rowid=f.rowid
+                       WHERE f.father_name MATCH ?
+                         AND r.district_name=? AND r.upazila_name=?
+                         AND r.father_name LIKE ?
+                       ORDER BY CASE
+                           WHEN r.father_name=? THEN 0
+                           WHEN r.father_name LIKE ? THEN 1
+                           ELSE 2
+                       END, r.father_name'''
+                args=[phrase,district,upazila,'%'+father+'%',father,father+'%']
+            elif mother_only and len(mother) >= 3 and _aux_fts_is_ready(item['id']):
+                phrase='"'+mother.replace('\"','\"\"')+'"'
+                sql='''SELECT r.data_json
+                       FROM records_aux_fts AS f
+                       JOIN records AS r ON r.rowid=f.rowid
+                       WHERE f.mother_name MATCH ?
+                         AND r.district_name=? AND r.upazila_name=?
+                         AND r.mother_name LIKE ?
+                       ORDER BY CASE
+                           WHEN r.mother_name=? THEN 0
+                           WHEN r.mother_name LIKE ? THEN 1
+                           ELSE 2
+                       END, r.mother_name'''
+                args=[phrase,district,upazila,'%'+mother+'%',mother,mother+'%']
+            elif dob_only and _aux_fts_is_ready(item['id']):
+                year,_=_parse_dob_query(dob)
+                if year:
+                    sql='''SELECT r.data_json
+                           FROM records_aux_fts AS f
+                           JOIN records AS r ON r.rowid=f.rowid
+                           WHERE f.birth_date MATCH ?
+                             AND r.district_name=? AND r.upazila_name=?'''
+                    args=[_fts_year_query(year),district,upazila]
+                    post_filter_dob=True
+                else:
+                    sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=? AND birth_date LIKE ?'
+                    args=[district,upazila,'%'+dob+'%']
             else:
                 sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
                 for col,val in filters:
@@ -766,14 +929,17 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                         sql += f' AND {col}=?'; args.append(val)
                     else:
                         sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
-                # Preserve the historical cap everywhere except name-only.
-                # Nickname searches must not silently omit valid matches just
-                # because there are more than 500 of them.
-                if exact or not name_only:
+                # Preserve the historical cap for multi-field compatibility.
+                # Single-field name/parent/DOB searches must not silently omit
+                # valid matches merely because there are more than 500 rows.
+                if exact or not (name_only or father_only or mother_only or dob_only):
                     sql += ' LIMIT 500'
             found=[]
             for raw in conn.execute(sql,args).fetchall():
-                d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
+                d=record_from_db(raw)
+                if post_filter_dob and not _dob_matches(d.get('birth_date',''), dob):
+                    continue
+                d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
             if found:
                 _route_add(district,upazila,item['id'])
             return found, None
@@ -866,6 +1032,40 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
         return {'ok':True,'count':len(result),'results':result,'errors':errors,
                 'search_mode':mode,
                 'route_cache_hit':bool(routed_items),'databases_queried':len(all_items)}
+
+    # Single parent-name searches use the same completeness rule as nickname
+    # search: query every enabled DB in parallel, with trigram FTS when ready.
+    if father_only or mother_only:
+        result,errors=aggregate(all_items,False)
+        field='father_name' if father_only else 'mother_name'
+        needle=father if father_only else mother
+        def parent_rank(row):
+            value=str(row.get(field) or '').strip()
+            if value == needle:
+                rank=0
+            elif value.startswith(needle):
+                rank=1
+            else:
+                rank=2
+            return (rank,value)
+        result.sort(key=parent_rank)
+        mode=('father_trigram_all_db' if father_only else 'mother_trigram_all_db')
+        if not all(_aux_fts_is_ready(x['id']) for x in all_items):
+            mode=('father_contains_all_db' if father_only else 'mother_contains_all_db')
+        return {'ok':True,'count':len(result),'results':result,'errors':errors,
+                'search_mode':mode,'route_cache_hit':bool(routed_items),
+                'databases_queried':len(all_items)}
+
+    # DOB-only accepts either a complete date or just a year. The FTS year
+    # lookup narrows candidates quickly; Python normalization then guarantees
+    # DD/MM/YYYY and YYYY-MM-DD style dates compare as the same birthday.
+    if dob_only:
+        result,errors=aggregate(all_items,False)
+        mode=('dob_trigram_all_db' if all(_aux_fts_is_ready(x['id']) for x in all_items)
+              else 'dob_contains_all_db')
+        return {'ok':True,'count':len(result),'results':result,'errors':errors,
+                'search_mode':mode,'route_cache_hit':bool(routed_items),
+                'databases_queried':len(all_items)}
 
     # Other partial searches retain V9.6 compatibility and routing behavior.
     exact = False if detail_count else True
