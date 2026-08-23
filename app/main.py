@@ -1,6 +1,7 @@
 import hashlib, json, os, re, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from threading import Lock, Thread
 
 import libsql
 import firebase_admin
@@ -19,6 +20,71 @@ MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
 PREVIEW_CACHE_TTL = int(os.getenv('PREVIEW_CACHE_TTL_SECONDS', '900'))
 PREVIEW_CACHE_MAX = int(os.getenv('PREVIEW_CACHE_MAX_ITEMS', '6'))
 _PREVIEW_CACHE = {}
+
+# Search routing cache: (district, upazila) -> configured Turso database ids.
+# It is built in the background and never blocks application startup. If the
+# cache is missing/stale, public_search falls back to the full multi-DB scan,
+# preserving result completeness.
+_AREA_ROUTE_CACHE = {}
+_AREA_ROUTE_LOCK = Lock()
+_AREA_ROUTE_READY = False
+
+def _area_key(district: str, upazila: str):
+    return (str(district or '').strip(), str(upazila or '').strip())
+
+def _route_get(district: str, upazila: str):
+    key = _area_key(district, upazila)
+    with _AREA_ROUTE_LOCK:
+        return tuple(_AREA_ROUTE_CACHE.get(key, ()))
+
+def _route_add(district: str, upazila: str, database_id: str):
+    key = _area_key(district, upazila)
+    if not key[0] or not key[1] or not database_id:
+        return
+    with _AREA_ROUTE_LOCK:
+        current = set(_AREA_ROUTE_CACHE.get(key, ()))
+        current.add(str(database_id))
+        _AREA_ROUTE_CACHE[key] = tuple(sorted(current))
+
+def _rebuild_area_route_cache():
+    global _AREA_ROUTE_READY
+    local = {}
+    items = turso_catalog(False)
+
+    def scan(item):
+        conn = None
+        try:
+            conn = connect_item(item, ensure=False)
+            rows = conn.execute(
+                "SELECT DISTINCT district_name,upazila_name FROM records "
+                "WHERE district_name<>'' AND upazila_name<>''"
+            ).fetchall()
+            return item['id'], rows
+        except Exception:
+            return item['id'], []
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
+
+    if items:
+        with ThreadPoolExecutor(max_workers=max(1, min(len(items), 5))) as pool:
+            for dbid, rows in pool.map(scan, items):
+                for district, upazila in rows:
+                    key = _area_key(district, upazila)
+                    if not key[0] or not key[1]:
+                        continue
+                    local.setdefault(key, set()).add(str(dbid))
+    with _AREA_ROUTE_LOCK:
+        _AREA_ROUTE_CACHE.clear()
+        _AREA_ROUTE_CACHE.update({k: tuple(sorted(v)) for k, v in local.items()})
+        _AREA_ROUTE_READY = True
+
+def _start_route_cache_builder():
+    try:
+        Thread(target=_rebuild_area_route_cache, name='area-route-cache', daemon=True).start()
+    except Exception:
+        pass
 
 def _parse_cache_key(data: bytes, district: str, upazila: str) -> str:
     h = hashlib.sha256()
@@ -426,7 +492,11 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     district=district.strip(); upazila=upazila.strip()
     name=name.strip(); father=father.strip(); mother=mother.strip(); dob=dob.strip()
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
-    items=turso_catalog(False)
+    all_items=turso_catalog(False)
+    item_by_id={x['id']:x for x in all_items}
+    routed_ids=_route_get(district,upazila)
+    routed_items=[item_by_id[x] for x in routed_ids if x in item_by_id]
+    primary_items=routed_items or all_items
     filters=[('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]
     detail_count=sum(1 for _,v in filters if v)
 
@@ -445,6 +515,8 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             found=[]
             for raw in conn.execute(sql,args).fetchall():
                 d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
+            if found:
+                _route_add(district,upazila,item['id'])
             return found, None
         except Exception as exc:
             return [], {'database_id':item['id'],'error':type(exc).__name__}
@@ -460,10 +532,9 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             if key not in uniq: uniq[key]=d
         return list(uniq.values())
 
-    # A person-specific lookup is overwhelmingly expected to resolve to one DB.
-    # Fire exact indexed queries to every DB concurrently and return as soon as the
-    # first DB finds a match; do not wait for slower unrelated databases.
-    if detail_count >= 2 and items:
+    def exact_first(items):
+        if not items:
+            return [], []
         pool=ThreadPoolExecutor(max_workers=max(1,min(len(items),5)))
         futures=[pool.submit(search_one,item,True) for item in items]
         errors=[]
@@ -475,23 +546,55 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                     for other in futures:
                         if other is not fut: other.cancel()
                     pool.shutdown(wait=False, cancel_futures=True)
-                    result=dedupe(found)
-                    return {'ok':True,'count':len(result),'results':result,'errors':errors,'search_mode':'fast_exact_first'}
+                    return dedupe(found), errors
         finally:
-            # If every exact query completed with no match, all workers are done.
             pool.shutdown(wait=False, cancel_futures=True)
+        return [], errors
 
-    # Compatibility path: partial matching and broad area searches still aggregate
-    # every enabled Turso database, preserving the V9.6 public-search behaviour.
-    rows=[]; errors=[]
-    workers=max(1,min(len(items),5))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures=[pool.submit(search_one,item,False if detail_count else True) for item in items]
-        for fut in as_completed(futures):
-            found,err=fut.result(); rows.extend(found)
-            if err: errors.append(err)
-    result=dedupe(rows)
-    return {'ok':True,'count':len(result),'results':result,'errors':errors,'search_mode':'aggregate_partial' if detail_count else 'aggregate_area'}
+    def aggregate(items, exact):
+        rows=[]; errors=[]
+        if not items:
+            return rows, errors
+        workers=max(1,min(len(items),5))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures=[pool.submit(search_one,item,exact) for item in items]
+            for fut in as_completed(futures):
+                found,err=fut.result(); rows.extend(found)
+                if err: errors.append(err)
+        return dedupe(rows), errors
+
+    # Fast path: if background routing knows the area, query only the DB(s) that
+    # actually contain it. Exact person lookups return on the first match.
+    if detail_count >= 2:
+        result,errors=exact_first(primary_items)
+        if result:
+            return {'ok':True,'count':len(result),'results':result,'errors':errors,
+                    'search_mode':'routed_exact_first' if routed_items else 'fast_exact_first',
+                    'route_cache_hit':bool(routed_items),'databases_queried':len(primary_items)}
+        # A stale route must never hide a valid record. Retry every enabled DB.
+        if routed_items and len(routed_items) < len(all_items):
+            result2,errors2=exact_first(all_items)
+            errors.extend(errors2)
+            if result2:
+                return {'ok':True,'count':len(result2),'results':result2,'errors':errors,
+                        'search_mode':'route_fallback_exact','route_cache_hit':True,
+                        'databases_queried':len(all_items)}
+
+    # Partial searches retain V9.6 compatibility. Use routed DBs first; only when
+    # they produce no match do we fan out to every DB.
+    exact = False if detail_count else True
+    result,errors=aggregate(primary_items,exact)
+    if result:
+        return {'ok':True,'count':len(result),'results':result,'errors':errors,
+                'search_mode':'routed_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area'),
+                'route_cache_hit':bool(routed_items),'databases_queried':len(primary_items)}
+    if routed_items and len(routed_items) < len(all_items):
+        result2,errors2=aggregate(all_items,exact)
+        errors.extend(errors2)
+        result=result2
+    return {'ok':True,'count':len(result),'results':result,'errors':errors,
+            'search_mode':'route_fallback_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area'),
+            'route_cache_hit':bool(routed_items),'databases_queried':len(all_items) if routed_items else len(primary_items)}
 
 async def read_pdf(file:UploadFile):
     data=await file.read()
@@ -527,6 +630,7 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
     try: write_result=write_rows(rows,item)
     except Exception as e: raise HTTPException(500,f'Turso write failed: {type(e).__name__}: {e}') from e
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
+    _route_add(district, upazila, item['id'])
     now=datetime.now(timezone.utc).isoformat()
     written=int(write_result['records_written'])
     log={'database_id':item['id'],'database_name':item['name'],'district_name':district,'upazila_name':upazila,
