@@ -315,8 +315,11 @@ def _comparable_record(row):
     return r
 
 
-def write_rows(rows, item):
-    conn = connect_item(item)
+def write_rows(rows, item, import_meta=None):
+    # The schema already exists for configured Turso databases. Avoid repeating
+    # CREATE TABLE/INDEX checks on every upload; those remote DDL round-trips
+    # were a major part of post-preview upload latency.
+    conn = connect_item(item, ensure=False)
     try:
         # Classify incoming rows before the UPSERT so the Admin Panel can report
         # exact new / updated / unchanged counts instead of showing 0 for all.
@@ -365,6 +368,22 @@ def write_rows(rows, item):
             # sqlite-compatible DB-API; executemany keeps the upload far cheaper
             # than one network commit per row. Unchanged rows are not rewritten.
             conn.executemany(UPSERT_SQL, to_write)
+
+        # Keep the import audit row in the SAME connection/transaction as the
+        # record write. This removes a second Turso connection + schema check +
+        # commit from every upload.
+        if import_meta:
+            iid='import_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
+            conn.execute(
+                'INSERT INTO pdf_imports(id,database_id,district_name,upazila_name,file_name,records_detected,records_written,created_at,uploaded_by,parser) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                (iid, import_meta.get('database_id',''), import_meta.get('district_name',''),
+                 import_meta.get('upazila_name',''), import_meta.get('file_name',''),
+                 int(import_meta.get('records_detected',0)), added + updated,
+                 import_meta.get('created_at',''), import_meta.get('uploaded_by',''),
+                 import_meta.get('parser',''))
+            )
+
+        if to_write or import_meta:
             conn.commit()
 
         return {
@@ -515,6 +534,13 @@ def _cache_store(kind, data):
     with _METRICS_CACHE_LOCK:
         _METRICS_CACHE[kind]={'ts':time.time(),'data':data}
         _METRICS_REFRESHING[kind]=False
+
+def _fast_cache_clear():
+    with _METRICS_CACHE_LOCK:
+        _METRICS_CACHE['stats'] = None
+        _METRICS_CACHE['usage'] = None
+        _METRICS_REFRESHING['stats'] = False
+        _METRICS_REFRESHING['usage'] = False
 
 
 def _refresh_metrics(kind):
@@ -741,11 +767,25 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
         except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
     item=get_target(database_id)
-    try: write_result=write_rows(rows,item)
-    except Exception as e: raise HTTPException(500,f'Turso write failed: {type(e).__name__}: {e}') from e
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
-    _route_add(district, upazila, item['id'])
     now=datetime.now(timezone.utc).isoformat()
+    parser_name='PY-RENDER-V9.6-WARD-UNICODE-UPLOAD-FAST2'
+    import_meta={
+        'database_id':item['id'], 'district_name':district, 'upazila_name':upazila,
+        'file_name':file.filename, 'records_detected':len(rows), 'created_at':now,
+        'uploaded_by':user.get('email',''), 'parser':parser_name,
+    }
+    started=time.perf_counter()
+    try: write_result=write_rows(rows,item,import_meta=import_meta)
+    except Exception as e: raise HTTPException(500,f'Turso write failed: {type(e).__name__}: {e}') from e
+    upload_seconds=round(time.perf_counter()-started,3)
+    _route_add(district, upazila, item['id'])
+    # Usage/stats caches are now stale after a successful write. Clear them so
+    # the next dashboard refresh is correct without slowing the upload itself.
+    try:
+        _fast_cache_clear()
+    except Exception:
+        pass
     written=int(write_result['records_written'])
     log={'database_id':item['id'],'database_name':item['name'],'district_name':district,'upazila_name':upazila,
          'file_name':file.filename,'records_detected':len(rows),'records_written':written,
@@ -755,13 +795,6 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
          'duplicate_input_keys':write_result['duplicate_input_keys'],
          'records_added_or_updated':write_result['records_added']+write_result['records_updated'],
          'raw_preserved':raw,'created_at':now,'uploaded_by':user.get('email',''),
-         'preview_cache_hit':cache_hit,
-         'parser':'PY-RENDER-V9.6-WARD-UNICODE-UPLOAD-FAST'}
-    conn=connect_item(item)
-    try:
-        iid='import_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
-        conn.execute('INSERT INTO pdf_imports(id,database_id,district_name,upazila_name,file_name,records_detected,records_written,created_at,uploaded_by,parser) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                     (iid,item['id'],district,upazila,file.filename,len(rows),written,now,user.get('email',''),log['parser']))
-        conn.commit()
-    finally: conn.close()
+         'preview_cache_hit':cache_hit,'upload_db_seconds':upload_seconds,
+         'parser':parser_name}
     return {'ok':True,**log}
