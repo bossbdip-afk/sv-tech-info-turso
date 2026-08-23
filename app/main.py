@@ -839,13 +839,39 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                         'search_mode':'route_fallback_exact','route_cache_hit':True,
                         'databases_queried':len(all_items)}
 
-    # Partial searches retain V9.6 compatibility. Name-only can use the trigram
-    # index, while father/mother/DOB partial searches keep their existing logic.
+    # Name-only/nickname search must be COMPLETE across every enabled Turso DB.
+    # Do not stop at the area-route cache here: the cache is an optimization,
+    # not a completeness guarantee, and the same district/upazila may exist in
+    # more than one database. Trigram FTS keeps the contains lookup fast while
+    # all databases are queried in parallel. No gender condition is applied.
+    if name_only:
+        result,errors=aggregate(all_items,False)
+
+        # Futures complete in arbitrary order, so apply one global relevance
+        # ordering after dedupe: exact name first, then prefix, then contains.
+        # This changes presentation only; every valid contains match is kept.
+        def name_rank(row):
+            row_name=str(row.get('name') or '').strip()
+            if row_name == name:
+                rank=0
+            elif row_name.startswith(name):
+                rank=1
+            else:
+                rank=2
+            return (rank, row_name)
+        result.sort(key=name_rank)
+
+        mode = ('name_trigram_all_db' if all(_name_fts_is_ready(x['id']) for x in all_items)
+                else 'name_contains_all_db')
+        return {'ok':True,'count':len(result),'results':result,'errors':errors,
+                'search_mode':mode,
+                'route_cache_hit':bool(routed_items),'databases_queried':len(all_items)}
+
+    # Other partial searches retain V9.6 compatibility and routing behavior.
     exact = False if detail_count else True
     result,errors=aggregate(primary_items,exact)
     if result:
-        mode = ('routed_name_trigram' if name_only and all(_name_fts_is_ready(x['id']) for x in primary_items)
-                else ('routed_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area')))
+        mode = ('routed_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area'))
         return {'ok':True,'count':len(result),'results':result,'errors':errors,
                 'search_mode':mode,
                 'route_cache_hit':bool(routed_items),'databases_queried':len(primary_items)}
@@ -853,8 +879,7 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
         result2,errors2=aggregate(all_items,exact)
         errors.extend(errors2)
         result=result2
-    mode = ('name_trigram' if name_only and all(_name_fts_is_ready(x['id']) for x in (all_items if routed_items else primary_items))
-            else ('route_fallback_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area')))
+    mode = ('route_fallback_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area'))
     return {'ok':True,'count':len(result),'results':result,'errors':errors,
             'search_mode':mode,
             'route_cache_hit':bool(routed_items),'databases_queried':len(all_items) if routed_items else len(primary_items)}
