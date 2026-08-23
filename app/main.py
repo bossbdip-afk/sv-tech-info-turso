@@ -29,6 +29,14 @@ _AREA_ROUTE_CACHE = {}
 _AREA_ROUTE_LOCK = Lock()
 _AREA_ROUTE_READY = False
 
+# Dashboard/storage metrics cache. Remote Turso databases are queried in parallel,
+# then the aggregate is kept briefly in memory. Stale cached data is returned
+# immediately while a daemon thread refreshes it in the background.
+DASHBOARD_CACHE_TTL = int(os.getenv('DASHBOARD_CACHE_TTL_SECONDS', '120'))
+_METRICS_CACHE = {'stats': None, 'usage': None}
+_METRICS_CACHE_LOCK = Lock()
+_METRICS_REFRESHING = {'stats': False, 'usage': False}
+
 def _area_key(district: str, upazila: str):
     return (str(district or '').strip(), str(upazila or '').strip())
 
@@ -138,6 +146,15 @@ app = FastAPI(title=APP_NAME, version='9.6.1')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
+
+@app.on_event('startup')
+def _warm_background_caches():
+    # Do not block Railway startup. Warm search routing plus dashboard/storage
+    # metrics in daemon threads so the first admin page load is usually instant.
+    _start_route_cache_builder()
+    _start_metrics_refresh('stats')
+    _start_metrics_refresh('usage')
+
 
 async def current_user(authorization: str | None = Header(default=None)):
     if SKIP_AUTH:
@@ -402,7 +419,7 @@ def _database_usage(item):
     """
     limit_gb = _db_limit_gb(item)
     limit_bytes = max(1, int(limit_gb * 1024 * 1024 * 1024))
-    conn = connect_item(item)
+    conn = connect_item(item, ensure=False)
     try:
         records = int(conn.execute('SELECT COUNT(*) FROM records').fetchone()[0])
         method = 'sqlite_live_pages'
@@ -432,31 +449,128 @@ def _database_usage(item):
         conn.close()
 
 
+def _usage_snapshot():
+    items = turso_catalog(True)
+    databases=[]; errors=[]
+
+    def one(item):
+        try:
+            return ('ok', _database_usage(item))
+        except Exception as exc:
+            return ('err', {'id':item['id'],'name':item['name'],'error':type(exc).__name__})
+
+    if items:
+        workers=max(1,min(len(items),5))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for kind, payload in pool.map(one, items):
+                (databases if kind=='ok' else errors).append(payload)
+    databases.sort(key=lambda x: int(x.get('slot') or 0))
+    return {'ok':True,'databases':databases,'errors':errors,
+            'default_limit_gb':float(os.getenv('TURSO_DATABASE_LIMIT_GB','5') or 5)}
+
+
+def _stats_snapshot():
+    items=turso_catalog(False)
+    total=0; districts=set(); upazilas=set(); sources=[]; errors=[]
+
+    def one(item):
+        conn=None
+        try:
+            conn=connect_item(item, ensure=False)
+            t=int(conn.execute('SELECT COUNT(*) FROM records').fetchone()[0])
+            ds=[str(r[0]) for r in conn.execute(
+                "SELECT DISTINCT district_name FROM records WHERE district_name<>''"
+            ).fetchall()]
+            us=[(str(r[0]),str(r[1])) for r in conn.execute(
+                "SELECT DISTINCT district_name,upazila_name FROM records WHERE upazila_name<>''"
+            ).fetchall()]
+            return ('ok', item, t, ds, us)
+        except Exception as exc:
+            return ('err', item, type(exc).__name__, [], [])
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
+
+    if items:
+        workers=max(1,min(len(items),5))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for result in pool.map(one, items):
+                if result[0]=='ok':
+                    _, item, t, ds, us=result
+                    total += t
+                    districts.update(ds)
+                    upazilas.update(us)
+                    sources.append({'id':item['id'],'name':item['name'],'total':t,'slot':item.get('slot')})
+                else:
+                    _, item, err, _, _=result
+                    errors.append({'id':item['id'],'name':item['name'],'error':err})
+    sources.sort(key=lambda x: int(x.get('slot') or 0))
+    for x in sources: x.pop('slot',None)
+    return {'ok':True,'total':total,'districts':len(districts),'upazilas':len(upazilas),
+            'sources':sources,'errors':errors}
+
+
+def _cache_store(kind, data):
+    with _METRICS_CACHE_LOCK:
+        _METRICS_CACHE[kind]={'ts':time.time(),'data':data}
+        _METRICS_REFRESHING[kind]=False
+
+
+def _refresh_metrics(kind):
+    try:
+        data = _stats_snapshot() if kind=='stats' else _usage_snapshot()
+        _cache_store(kind, data)
+    except Exception:
+        with _METRICS_CACHE_LOCK:
+            _METRICS_REFRESHING[kind]=False
+
+
+def _start_metrics_refresh(kind):
+    with _METRICS_CACHE_LOCK:
+        if _METRICS_REFRESHING.get(kind):
+            return
+        _METRICS_REFRESHING[kind]=True
+    try:
+        Thread(target=_refresh_metrics,args=(kind,),name=f'{kind}-cache-refresh',daemon=True).start()
+    except Exception:
+        with _METRICS_CACHE_LOCK:
+            _METRICS_REFRESHING[kind]=False
+
+
+def _cached_metrics(kind):
+    now=time.time()
+    with _METRICS_CACHE_LOCK:
+        item=_METRICS_CACHE.get(kind)
+        refreshing=bool(_METRICS_REFRESHING.get(kind))
+    if item:
+        age=max(0.0,now-float(item.get('ts',0)))
+        data=dict(item['data'])
+        data['cache_age_seconds']=round(age,1)
+        data['cached']=True
+        if age <= DASHBOARD_CACHE_TTL:
+            data['refreshing']=refreshing
+            return data
+        _start_metrics_refresh(kind)
+        data['refreshing']=True
+        data['stale']=True
+        return data
+    # First request after a cold start: query all DBs in parallel once.
+    data = _stats_snapshot() if kind=='stats' else _usage_snapshot()
+    _cache_store(kind, data)
+    out=dict(data); out.update({'cached':False,'cache_age_seconds':0,'refreshing':False})
+    return out
+
+
 @app.get('/turso/usage-all')
 def turso_usage_all(user=Depends(current_user)):
-    databases=[]; errors=[]
-    for item in turso_catalog(True):
-        try:
-            databases.append(_database_usage(item))
-        except Exception as exc:
-            errors.append({'id':item['id'],'name':item['name'],'error':type(exc).__name__})
-    return {'ok':True,'databases':databases,'errors':errors,'default_limit_gb':float(os.getenv('TURSO_DATABASE_LIMIT_GB','5') or 5)}
+    return _cached_metrics('usage')
 
 
 @app.get('/turso/stats-all')
 def turso_stats_all(user=Depends(current_user)):
-    total=0; districts=set(); upazilas=set(); sources=[]; errors=[]
-    for item in turso_catalog(False):
-        try:
-            conn=connect_item(item)
-            t=int(conn.execute('SELECT COUNT(*) FROM records').fetchone()[0])
-            for r in conn.execute("SELECT DISTINCT district_name FROM records WHERE district_name<>''").fetchall(): districts.add(str(r[0]))
-            for r in conn.execute("SELECT DISTINCT district_name,upazila_name FROM records WHERE upazila_name<>''").fetchall(): upazilas.add((str(r[0]),str(r[1])))
-            conn.close(); total += t
-            sources.append({'id':item['id'],'name':item['name'],'total':t})
-        except Exception as exc:
-            errors.append({'id':item['id'],'name':item['name'],'error':type(exc).__name__})
-    return {'ok':True,'total':total,'districts':len(districts),'upazilas':len(upazilas),'sources':sources,'errors':errors}
+    return _cached_metrics('stats')
+
 
 @app.get('/turso/areas')
 def turso_areas(database_id:str='', user=Depends(current_user)):
