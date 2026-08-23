@@ -142,7 +142,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.6.2')
+app = FastAPI(title=APP_NAME, version='9.6.1')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -719,28 +719,25 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                 if err: errors.append(err)
         return dedupe(rows), errors
 
-    # Fast path for ANY person filter, including name-only search.  The previous
-    # code sent a one-field search straight to LIKE '%value%', which is expensive
-    # on large remote Turso tables and made a simple exact name lookup take minutes.
-    # Try indexed equality first and aggregate all matching rows from the routed
-    # database(s).  This preserves cases where several voters have the same name.
-    if detail_count >= 1:
-        result,errors=aggregate(primary_items,True)
+    # Fast path: if background routing knows the area, query only the DB(s) that
+    # actually contain it. Exact person lookups return on the first match.
+    if detail_count >= 2:
+        result,errors=exact_first(primary_items)
         if result:
             return {'ok':True,'count':len(result),'results':result,'errors':errors,
-                    'search_mode':'routed_exact' if routed_items else 'aggregate_exact',
+                    'search_mode':'routed_exact_first' if routed_items else 'fast_exact_first',
                     'route_cache_hit':bool(routed_items),'databases_queried':len(primary_items)}
-        # A stale route must never hide a valid exact record. Retry all enabled DBs.
+        # A stale route must never hide a valid record. Retry every enabled DB.
         if routed_items and len(routed_items) < len(all_items):
-            result2,errors2=aggregate(all_items,True)
+            result2,errors2=exact_first(all_items)
             errors.extend(errors2)
             if result2:
                 return {'ok':True,'count':len(result2),'results':result2,'errors':errors,
                         'search_mode':'route_fallback_exact','route_cache_hit':True,
                         'databases_queried':len(all_items)}
 
-    # Compatibility fallback: only if exact equality found nothing, run the old
-    # substring LIKE search. This keeps partial-name/father/mother searches working.
+    # Partial searches retain V9.6 compatibility. Use routed DBs first; only when
+    # they produce no match do we fan out to every DB.
     exact = False if detail_count else True
     result,errors=aggregate(primary_items,exact)
     if result:
