@@ -427,38 +427,24 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     name=name.strip(); father=father.strip(); mother=mother.strip(); dob=dob.strip()
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
     items=turso_catalog(False)
-
     filters=[('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]
-    has_detail_filter=any(v for _,v in filters)
+    detail_count=sum(1 for _,v in filters if v)
 
-    def run_query(conn, exact=True):
-        sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'
-        args=[district,upazila]
-        for col,val in filters:
-            if not val:
-                continue
-            if exact:
-                sql += f' AND {col}=?'; args.append(val)
-            else:
-                sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
-        sql += ' LIMIT 500'
-        return conn.execute(sql,args).fetchall()
-
-    def search_one(item):
+    def search_one(item, exact=True):
         conn=None
         try:
             conn=connect_item(item, ensure=False)
-            # Fast path: exact values can use the normal/composite indexes.
-            raw_rows=run_query(conn, exact=True)
-            # Preserve V9.6 partial-search behaviour. Only pay for the slower
-            # contains query when exact matching found nothing.
-            if not raw_rows and has_detail_filter:
-                raw_rows=run_query(conn, exact=False)
+            sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
+            for col,val in filters:
+                if not val: continue
+                if exact:
+                    sql += f' AND {col}=?'; args.append(val)
+                else:
+                    sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
+            sql += ' LIMIT 500'
             found=[]
-            for raw in raw_rows:
-                d=record_from_db(raw)
-                d['_database_id']=item['id']; d['_database_name']=item['name']
-                found.append(d)
+            for raw in conn.execute(sql,args).fetchall():
+                d=record_from_db(raw); d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
             return found, None
         except Exception as exc:
             return [], {'database_id':item['id'],'error':type(exc).__name__}
@@ -467,22 +453,45 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                 try: conn.close()
                 except Exception: pass
 
+    def dedupe(rows):
+        uniq={}
+        for d in rows:
+            key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','birth_date','district_name','upazila_name'))
+            if key not in uniq: uniq[key]=d
+        return list(uniq.values())
+
+    # A person-specific lookup is overwhelmingly expected to resolve to one DB.
+    # Fire exact indexed queries to every DB concurrently and return as soon as the
+    # first DB finds a match; do not wait for slower unrelated databases.
+    if detail_count >= 2 and items:
+        pool=ThreadPoolExecutor(max_workers=max(1,min(len(items),5)))
+        futures=[pool.submit(search_one,item,True) for item in items]
+        errors=[]
+        try:
+            for fut in as_completed(futures):
+                found,err=fut.result()
+                if err: errors.append(err)
+                if found:
+                    for other in futures:
+                        if other is not fut: other.cancel()
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    result=dedupe(found)
+                    return {'ok':True,'count':len(result),'results':result,'errors':errors,'search_mode':'fast_exact_first'}
+        finally:
+            # If every exact query completed with no match, all workers are done.
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    # Compatibility path: partial matching and broad area searches still aggregate
+    # every enabled Turso database, preserving the V9.6 public-search behaviour.
     rows=[]; errors=[]
-    # Independent Turso databases are remote services. Query them in parallel so
-    # request time is near the slowest DB rather than the sum of all DB latencies.
     workers=max(1,min(len(items),5))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures=[pool.submit(search_one,item) for item in items]
+        futures=[pool.submit(search_one,item,False if detail_count else True) for item in items]
         for fut in as_completed(futures):
-            found,err=fut.result()
-            rows.extend(found)
+            found,err=fut.result(); rows.extend(found)
             if err: errors.append(err)
-
-    uniq={}
-    for d in rows:
-        key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','birth_date','district_name','upazila_name'))
-        if key not in uniq: uniq[key]=d
-    return {'ok':True,'count':len(uniq),'results':list(uniq.values()),'errors':errors}
+    result=dedupe(rows)
+    return {'ok':True,'count':len(result),'results':result,'errors':errors,'search_mode':'aggregate_partial' if detail_count else 'aggregate_area'}
 
 async def read_pdf(file:UploadFile):
     data=await file.read()
