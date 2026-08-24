@@ -861,12 +861,66 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
         conn=None
         try:
             conn=connect_item(item, ensure=False)
-            # Name-only is the expensive case. Prefer the trigram index so a
-            # contains lookup does not scan the whole district/upazila. FTS is
-            # only useful for 3+ character terms; shorter input safely falls
-            # back to the complete legacy LIKE query.
+            # Universal partial-search path for any 2+ field combination.
+            # Use the existing trigram indexes as candidate generators, then
+            # verify every supplied field against the real voter row. This
+            # keeps nickname/parent-name combinations complete while avoiding
+            # large area scans whenever at least one indexed term is usable.
             post_filter_dob=False
-            if name_only and len(name) >= 3 and _name_fts_is_ready(item['id']):
+            if not exact and detail_count >= 2:
+                use_name_fts = bool(name) and len(name) >= 3 and _name_fts_is_ready(item['id'])
+                dob_year, _ = _parse_dob_query(dob) if dob else ('', '')
+                use_aux_fts = _aux_fts_is_ready(item['id']) and bool(
+                    (father and len(father) >= 3) or
+                    (mother and len(mother) >= 3) or
+                    (dob and dob_year)
+                )
+
+                sql = 'SELECT r.data_json FROM records AS r'
+                args = []
+                if use_name_fts:
+                    sql += ' JOIN records_name_fts AS nf ON nf.rowid=r.rowid'
+                if use_aux_fts:
+                    sql += ' JOIN records_aux_fts AS af ON af.rowid=r.rowid'
+
+                sql += ' WHERE r.district_name=? AND r.upazila_name=?'
+                args.extend([district, upazila])
+
+                if name:
+                    if use_name_fts:
+                        phrase='"'+name.replace('"','""')+'"'
+                        sql += ' AND nf.name MATCH ?'
+                        args.append(phrase)
+                    sql += ' AND instr(r.name,?)>0'
+                    args.append(name)
+
+                if father:
+                    if use_aux_fts and len(father) >= 3:
+                        phrase='"'+father.replace('"','""')+'"'
+                        sql += ' AND af.father_name MATCH ?'
+                        args.append(phrase)
+                    sql += ' AND instr(r.father_name,?)>0'
+                    args.append(father)
+
+                if mother:
+                    if use_aux_fts and len(mother) >= 3:
+                        phrase='"'+mother.replace('"','""')+'"'
+                        sql += ' AND af.mother_name MATCH ?'
+                        args.append(phrase)
+                    sql += ' AND instr(r.mother_name,?)>0'
+                    args.append(mother)
+
+                if dob:
+                    if use_aux_fts and dob_year:
+                        sql += ' AND af.birth_date MATCH ?'
+                        args.append(_fts_year_query(dob_year))
+                        post_filter_dob=True
+                    else:
+                        sql += ' AND r.birth_date LIKE ?'
+                        args.append('%'+dob+'%')
+                        post_filter_dob=True
+
+            elif name_only and len(name) >= 3 and _name_fts_is_ready(item['id']):
                 phrase='"'+name.replace('\"','\"\"')+'"'
                 sql='''SELECT r.data_json
                        FROM records_name_fts AS f
@@ -988,22 +1042,26 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                 if err: errors.append(err)
         return dedupe(rows), errors
 
-    # Fast path: if background routing knows the area, query only the DB(s) that
-    # actually contain it. Exact person lookups return on the first match.
+    # Any multi-field combination must be both COMPLETE and fast. Query every
+    # enabled Turso DB in parallel and let search_one intersect the supplied
+    # fields through trigram candidate indexes. Exact values are naturally a
+    # subset of the same contains query, so the old 1-2 second exact behavior
+    # is preserved without returning only the first database's match.
     if detail_count >= 2:
-        result,errors=exact_first(primary_items)
-        if result:
-            return {'ok':True,'count':len(result),'results':result,'errors':errors,
-                    'search_mode':'routed_exact_first' if routed_items else 'fast_exact_first',
-                    'route_cache_hit':bool(routed_items),'databases_queried':len(primary_items)}
-        # A stale route must never hide a valid record. Retry every enabled DB.
-        if routed_items and len(routed_items) < len(all_items):
-            result2,errors2=exact_first(all_items)
-            errors.extend(errors2)
-            if result2:
-                return {'ok':True,'count':len(result2),'results':result2,'errors':errors,
-                        'search_mode':'route_fallback_exact','route_cache_hit':True,
-                        'databases_queried':len(all_items)}
+        result,errors=aggregate(all_items,False)
+        need_name_fts = bool(name) and len(name) >= 3
+        need_aux_fts = bool(
+            (father and len(father) >= 3) or
+            (mother and len(mother) >= 3) or
+            (dob and _parse_dob_query(dob)[0])
+        )
+        indexes_ready = (
+            (not need_name_fts or all(_name_fts_is_ready(x['id']) for x in all_items)) and
+            (not need_aux_fts or all(_aux_fts_is_ready(x['id']) for x in all_items))
+        )
+        return {'ok':True,'count':len(result),'results':result,'errors':errors,
+                'search_mode':'combined_trigram_all_db' if indexes_ready else 'combined_partial_all_db',
+                'route_cache_hit':bool(routed_items),'databases_queried':len(all_items)}
 
     # Name-only/nickname search must be COMPLETE across every enabled Turso DB.
     # Do not stop at the area-route cache here: the cache is an optimization,
