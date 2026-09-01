@@ -11,7 +11,7 @@ from firebase_admin import auth, credentials
 
 from .parser import parse_pdf_bytes
 
-APP_NAME = 'SV Tech Multi-Turso PDF Backend'
+APP_NAME = 'SV Tech Backend V21'
 MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
 
 # Preview -> upload usually happens immediately with the same PDF.  Cache parsed
@@ -46,6 +46,13 @@ _AUX_FTS_READY = set()
 _AUX_FTS_FAILED = set()
 _AUX_FTS_LOCK = Lock()
 AUX_FTS_VERSION = 'parent-dob-trigram-v1'
+
+# V21 location search index. Village searches existing address/voter_area text.
+_GEO_FTS_READY = set()
+_GEO_FTS_FAILED = set()
+_GEO_FTS_LOCK = Lock()
+GEO_FTS_VERSION = 'address-area-ward-trigram-v1'
+SEARCH_WORKERS = max(1, int(os.getenv('SEARCH_WORKERS', '8')))
 
 _BN_DIGITS = '০১২৩৪৫৬৭৮৯'
 _ASCII_DIGITS = '0123456789'
@@ -124,6 +131,10 @@ def _name_fts_is_ready(database_id: str) -> bool:
 def _aux_fts_is_ready(database_id: str) -> bool:
     with _AUX_FTS_LOCK:
         return str(database_id) in _AUX_FTS_READY
+
+def _geo_fts_is_ready(database_id: str) -> bool:
+    with _GEO_FTS_LOCK:
+        return str(database_id) in _GEO_FTS_READY
 
 def _ascii_digits(value: str) -> str:
     return str(value or '').translate(_BN_TO_ASCII)
@@ -273,6 +284,41 @@ def _ensure_aux_search_index(item):
             try: conn.close()
             except Exception: pass
 
+def _ensure_geo_search_index(item):
+    """Create/backfill the V21 village/address/voter-area/ward trigram index."""
+    dbid=str(item.get('id',''))
+    with _GEO_FTS_LOCK:
+        if dbid in _GEO_FTS_READY:
+            return True
+        if dbid in _GEO_FTS_FAILED:
+            return False
+    conn=None
+    try:
+        conn=connect_item(item, ensure=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS search_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')")
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_geo_fts USING fts5(address,voter_area,ward_no, tokenize='trigram')")
+        conn.execute("CREATE TRIGGER IF NOT EXISTS records_geo_fts_ai AFTER INSERT ON records BEGIN INSERT INTO records_geo_fts(rowid,address,voter_area,ward_no) VALUES (new.rowid,COALESCE(new.address,''),COALESCE(new.voter_area,''),COALESCE(new.ward_no,'')); END")
+        conn.execute("CREATE TRIGGER IF NOT EXISTS records_geo_fts_ad AFTER DELETE ON records BEGIN DELETE FROM records_geo_fts WHERE rowid=old.rowid; END")
+        conn.execute("CREATE TRIGGER IF NOT EXISTS records_geo_fts_au AFTER UPDATE ON records BEGIN DELETE FROM records_geo_fts WHERE rowid=old.rowid; INSERT INTO records_geo_fts(rowid,address,voter_area,ward_no) VALUES (new.rowid,COALESCE(new.address,''),COALESCE(new.voter_area,''),COALESCE(new.ward_no,'')); END")
+        marker=conn.execute("SELECT value FROM search_index_meta WHERE key=?", (GEO_FTS_VERSION,)).fetchone()
+        if not marker:
+            conn.execute('DELETE FROM records_geo_fts')
+            conn.execute("INSERT INTO records_geo_fts(rowid,address,voter_area,ward_no) SELECT rowid,COALESCE(address,''),COALESCE(voter_area,''),COALESCE(ward_no,'') FROM records")
+            conn.execute("INSERT OR REPLACE INTO search_index_meta(key,value) VALUES (?,?)", (GEO_FTS_VERSION, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        with _GEO_FTS_LOCK:
+            _GEO_FTS_READY.add(dbid)
+            _GEO_FTS_FAILED.discard(dbid)
+        return True
+    except Exception:
+        with _GEO_FTS_LOCK:
+            _GEO_FTS_FAILED.add(dbid)
+        return False
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
+
 def _rebuild_name_search_indexes():
     items = turso_catalog(False)
     if not items:
@@ -281,6 +327,7 @@ def _rebuild_name_search_indexes():
     def build(item):
         _ensure_name_search_index(item)
         _ensure_aux_search_index(item)
+        _ensure_geo_search_index(item)
     with ThreadPoolExecutor(max_workers=max(1, min(len(items), 2))) as pool:
         list(pool.map(build, items))
 
@@ -338,7 +385,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='9.6.1')
+app = FastAPI(title=APP_NAME, version='21.0.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -841,164 +888,62 @@ def turso_delete_records(database_id:str='', district:str='', upazila:str='', us
     finally: conn.close()
 
 @app.get('/public/search')
-def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str='', user=Depends(current_user)):
-    district=district.strip(); upazila=upazila.strip()
-    name=name.strip(); father=father.strip(); mother=mother.strip(); dob=dob.strip()
+def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str='',village:str='',ward:str='', user=Depends(current_user)):
+    """V21 complete multi-field search across every enabled Turso database."""
+    district=' '.join(str(district or '').split()); upazila=' '.join(str(upazila or '').split())
+    name=' '.join(str(name or '').split()); father=' '.join(str(father or '').split())
+    mother=' '.join(str(mother or '').split()); dob=' '.join(str(dob or '').split())
+    village=' '.join(str(village or '').split()); ward=' '.join(str(ward or '').split())
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
     all_items=turso_catalog(False)
     item_by_id={x['id']:x for x in all_items}
     routed_ids=_route_get(district,upazila)
     routed_items=[item_by_id[x] for x in routed_ids if x in item_by_id]
-    primary_items=routed_items or all_items
-    filters=[('name',name),('father_name',father),('mother_name',mother),('birth_date',dob)]
-    detail_count=sum(1 for _,v in filters if v)
-    name_only = bool(name) and detail_count == 1
-    father_only = bool(father) and detail_count == 1
-    mother_only = bool(mother) and detail_count == 1
-    dob_only = bool(dob) and detail_count == 1
+    detail_count=sum(bool(x) for x in (name,father,mother,dob,village,ward))
 
-    def search_one(item, exact=True):
+    def phrase(value): return '"'+str(value).replace('"','""')+'"'
+
+    def search_one(item):
         conn=None
         try:
             conn=connect_item(item, ensure=False)
-            # Universal partial-search path for any 2+ field combination.
-            # Use the existing trigram indexes as candidate generators, then
-            # verify every supplied field against the real voter row. This
-            # keeps nickname/parent-name combinations complete while avoiding
-            # large area scans whenever at least one indexed term is usable.
-            post_filter_dob=False
-            if not exact and detail_count >= 2:
-                use_name_fts = bool(name) and len(name) >= 3 and _name_fts_is_ready(item['id'])
-                dob_year, _ = _parse_dob_query(dob) if dob else ('', '')
-                use_aux_fts = _aux_fts_is_ready(item['id']) and bool(
-                    (father and len(father) >= 3) or
-                    (mother and len(mother) >= 3) or
-                    (dob and dob_year)
-                )
-
-                sql = 'SELECT r.data_json FROM records AS r'
-                args = []
-                if use_name_fts:
-                    sql += ' JOIN records_name_fts AS nf ON nf.rowid=r.rowid'
-                if use_aux_fts:
-                    sql += ' JOIN records_aux_fts AS af ON af.rowid=r.rowid'
-
-                sql += ' WHERE r.district_name=? AND r.upazila_name=?'
-                args.extend([district, upazila])
-
-                if name:
-                    if use_name_fts:
-                        phrase='"'+name.replace('"','""')+'"'
-                        sql += ' AND nf.name MATCH ?'
-                        args.append(phrase)
-                    sql += ' AND instr(r.name,?)>0'
-                    args.append(name)
-
-                if father:
-                    if use_aux_fts and len(father) >= 3:
-                        phrase='"'+father.replace('"','""')+'"'
-                        sql += ' AND af.father_name MATCH ?'
-                        args.append(phrase)
-                    sql += ' AND instr(r.father_name,?)>0'
-                    args.append(father)
-
-                if mother:
-                    if use_aux_fts and len(mother) >= 3:
-                        phrase='"'+mother.replace('"','""')+'"'
-                        sql += ' AND af.mother_name MATCH ?'
-                        args.append(phrase)
-                    sql += ' AND instr(r.mother_name,?)>0'
-                    args.append(mother)
-
-                if dob:
-                    if use_aux_fts and dob_year:
-                        sql += ' AND af.birth_date MATCH ?'
-                        args.append(_fts_year_query(dob_year))
-                        post_filter_dob=True
-                    else:
-                        sql += ' AND r.birth_date LIKE ?'
-                        args.append('%'+dob+'%')
-                        post_filter_dob=True
-
-            elif name_only and len(name) >= 3 and _name_fts_is_ready(item['id']):
-                phrase='"'+name.replace('\"','\"\"')+'"'
-                sql='''SELECT r.data_json
-                       FROM records_name_fts AS f
-                       JOIN records AS r ON r.rowid=f.rowid
-                       WHERE f.name MATCH ?
-                         AND r.district_name=? AND r.upazila_name=?
-                         AND instr(r.name,?)>0
-                       ORDER BY CASE
-                           WHEN r.name=? THEN 0
-                           WHEN instr(r.name,?)=1 THEN 1
-                           ELSE 2
-                       END, r.name'''
-                args=[phrase,district,upazila,name,name,name]
-            elif father_only and len(father) >= 3 and _aux_fts_is_ready(item['id']):
-                phrase='"'+father.replace('\"','\"\"')+'"'
-                sql='''SELECT r.data_json
-                       FROM records_aux_fts AS f
-                       JOIN records AS r ON r.rowid=f.rowid
-                       WHERE f.father_name MATCH ?
-                         AND r.district_name=? AND r.upazila_name=?
-                         AND r.father_name LIKE ?
-                       ORDER BY CASE
-                           WHEN r.father_name=? THEN 0
-                           WHEN r.father_name LIKE ? THEN 1
-                           ELSE 2
-                       END, r.father_name'''
-                args=[phrase,district,upazila,'%'+father+'%',father,father+'%']
-            elif mother_only and len(mother) >= 3 and _aux_fts_is_ready(item['id']):
-                phrase='"'+mother.replace('\"','\"\"')+'"'
-                sql='''SELECT r.data_json
-                       FROM records_aux_fts AS f
-                       JOIN records AS r ON r.rowid=f.rowid
-                       WHERE f.mother_name MATCH ?
-                         AND r.district_name=? AND r.upazila_name=?
-                         AND r.mother_name LIKE ?
-                       ORDER BY CASE
-                           WHEN r.mother_name=? THEN 0
-                           WHEN r.mother_name LIKE ? THEN 1
-                           ELSE 2
-                       END, r.mother_name'''
-                args=[phrase,district,upazila,'%'+mother+'%',mother,mother+'%']
-            elif dob_only and _aux_fts_is_ready(item['id']):
-                year,_=_parse_dob_query(dob)
-                if year:
-                    sql='''SELECT r.data_json
-                           FROM records_aux_fts AS f
-                           JOIN records AS r ON r.rowid=f.rowid
-                           WHERE f.birth_date MATCH ?
-                             AND r.district_name=? AND r.upazila_name=?'''
-                    args=[_fts_year_query(year),district,upazila]
-                    post_filter_dob=True
-                else:
-                    sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=? AND birth_date LIKE ?'
-                    args=[district,upazila,'%'+dob+'%']
-            else:
-                sql='SELECT data_json FROM records WHERE district_name=? AND upazila_name=?'; args=[district,upazila]
-                for col,val in filters:
-                    if not val: continue
-                    if exact:
-                        sql += f' AND {col}=?'; args.append(val)
-                    else:
-                        sql += f' AND {col} LIKE ?'; args.append('%'+val+'%')
-                # Preserve the historical cap for multi-field compatibility.
-                # Single-field name/parent/DOB searches must not silently omit
-                # valid matches merely because there are more than 500 rows.
-                if exact or not (name_only or father_only or mother_only or dob_only):
-                    sql += ' LIMIT 500'
+            dob_year,_=_parse_dob_query(dob) if dob else ('','')
+            use_name=bool(name) and len(name)>=3 and _name_fts_is_ready(item['id'])
+            use_aux=_aux_fts_is_ready(item['id']) and bool((father and len(father)>=3) or (mother and len(mother)>=3) or (dob and dob_year))
+            use_geo=_geo_fts_is_ready(item['id']) and bool((village and len(village)>=3) or (ward and len(ward)>=3))
+            sql='SELECT r.data_json FROM records AS r'; args=[]
+            if use_name: sql+=' JOIN records_name_fts AS nf ON nf.rowid=r.rowid'
+            if use_aux: sql+=' JOIN records_aux_fts AS af ON af.rowid=r.rowid'
+            if use_geo: sql+=' JOIN records_geo_fts AS gf ON gf.rowid=r.rowid'
+            sql+=' WHERE r.district_name=? AND r.upazila_name=?'; args.extend([district,upazila])
+            if name:
+                if use_name: sql+=' AND nf.name MATCH ?'; args.append(phrase(name))
+                sql+=' AND instr(r.name,?)>0'; args.append(name)
+            if father:
+                if use_aux and len(father)>=3: sql+=' AND af.father_name MATCH ?'; args.append(phrase(father))
+                sql+=' AND instr(r.father_name,?)>0'; args.append(father)
+            if mother:
+                if use_aux and len(mother)>=3: sql+=' AND af.mother_name MATCH ?'; args.append(phrase(mother))
+                sql+=' AND instr(r.mother_name,?)>0'; args.append(mother)
+            if dob:
+                if use_aux and dob_year: sql+=' AND af.birth_date MATCH ?'; args.append(_fts_year_query(dob_year))
+                else: sql+=' AND instr(r.birth_date,?)>0'; args.append(dob)
+            if village:
+                if use_geo and len(village)>=3: sql+=' AND records_geo_fts MATCH ?'; args.append(phrase(village))
+                sql+=' AND (instr(r.address,?)>0 OR instr(r.voter_area,?)>0)'; args.extend([village,village])
+            if ward:
+                if use_geo and len(ward)>=3: sql+=' AND gf.ward_no MATCH ?'; args.append(phrase(ward))
+                sql+=' AND instr(r.ward_no,?)>0'; args.append(ward)
+            if not detail_count: sql+=' LIMIT 500'
             found=[]
             for raw in conn.execute(sql,args).fetchall():
                 d=record_from_db(raw)
-                if post_filter_dob and not _dob_matches(d.get('birth_date',''), dob):
-                    continue
+                if dob and not _dob_matches(d.get('birth_date',''),dob): continue
                 d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
-            if found:
-                _route_add(district,upazila,item['id'])
-            return found, None
+            if found: _route_add(district,upazila,item['id'])
+            return found,None
         except Exception as exc:
-            return [], {'database_id':item['id'],'error':type(exc).__name__}
+            return [],{'database_id':item['id'],'error':type(exc).__name__}
         finally:
             if conn is not None:
                 try: conn.close()
@@ -1007,162 +952,43 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     def dedupe(rows):
         uniq={}
         for d in rows:
-            key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','birth_date','district_name','upazila_name'))
+            key=str(d.get('voter_no') or '').strip() or '|'.join(str(d.get(k,'')).strip() for k in ('name','father_name','mother_name','birth_date','district_name','upazila_name'))
             if key not in uniq: uniq[key]=d
         return list(uniq.values())
 
-    def exact_first(items):
-        if not items:
-            return [], []
-        rows = []; errors = []
-        workers = max(1, min(len(items), 5))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(search_one, item, True) for item in items]
-            for fut in as_completed(futures):
-                found, err = fut.result()
-                if found: rows.extend(found)
-                if err: errors.append(err)
-        return dedupe(rows), errors
+    def one_rank(value,needle):
+        if not needle: return 0
+        value=' '.join(str(value or '').split())
+        if value==needle: return 0
+        if value.startswith(needle): return 1
+        if needle in value.split(): return 2
+        if needle in value: return 3
+        return 20
 
-    def aggregate(items, exact):
-        rows=[]; errors=[]
-        if not items:
-            return rows, errors
-        workers=max(1,min(len(items),5))
+    def result_rank(row):
+        score=one_rank(row.get('name',''),name)+one_rank(row.get('father_name',''),father)+one_rank(row.get('mother_name',''),mother)
+        if dob: score += 0 if _dob_matches(row.get('birth_date',''),dob) else 20
+        if village: score += min(one_rank(row.get('address',''),village),one_rank(row.get('voter_area',''),village))
+        score += one_rank(row.get('ward_no',''),ward)
+        return (score,str(row.get('name') or ''),str(row.get('voter_no') or ''))
+
+    items_to_query=all_items if detail_count else (routed_items or all_items)
+    rows=[]; errors=[]
+    if items_to_query:
+        workers=max(1,min(len(items_to_query),SEARCH_WORKERS))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures=[pool.submit(search_one,item,exact) for item in items]
+            futures=[pool.submit(search_one,item) for item in items_to_query]
             for fut in as_completed(futures):
                 found,err=fut.result(); rows.extend(found)
                 if err: errors.append(err)
-        return dedupe(rows), errors
-
-    # Any multi-field combination must be both COMPLETE and fast. Query every
-    # enabled Turso DB in parallel and let search_one intersect the supplied
-    # fields through trigram candidate indexes. Exact values are naturally a
-    # subset of the same contains query, so the old 1-2 second exact behavior
-    # is preserved without returning only the first database's match.
-    if detail_count >= 2:
-        exact_res, exact_errs = exact_first(primary_items)
-        if exact_res:
-            return {'ok':True,'count':len(exact_res),'results':exact_res,'errors':exact_errs,
-                    'search_mode':'exact_first_fast','route_cache_hit':bool(routed_items),
-                    'databases_queried':len(primary_items)}
-        if routed_items and len(routed_items) < len(all_items):
-            exact_res2, exact_errs2 = exact_first(all_items)
-            exact_errs.extend(exact_errs2)
-            if exact_res2:
-                return {'ok':True,'count':len(exact_res2),'results':exact_res2,'errors':exact_errs,
-                        'search_mode':'exact_first_fallback','route_cache_hit':bool(routed_items),
-                        'databases_queried':len(all_items)}
-        result,errors=aggregate(all_items,False)
-        errors = exact_errs + errors
-        need_name_fts = bool(name) and len(name) >= 3
-        need_aux_fts = bool(
-            (father and len(father) >= 3) or
-            (mother and len(mother) >= 3) or
-            (dob and _parse_dob_query(dob)[0])
-        )
-        indexes_ready = (
-            (not need_name_fts or all(_name_fts_is_ready(x['id']) for x in all_items)) and
-            (not need_aux_fts or all(_aux_fts_is_ready(x['id']) for x in all_items))
-        )
-        return {'ok':True,'count':len(result),'results':result,'errors':errors,
-                'search_mode':'combined_trigram_all_db' if indexes_ready else 'combined_partial_all_db',
-                'route_cache_hit':bool(routed_items),'databases_queried':len(all_items)}
-
-    # Name-only/nickname search must be COMPLETE across every enabled Turso DB.
-    # Do not stop at the area-route cache here: the cache is an optimization,
-    # not a completeness guarantee, and the same district/upazila may exist in
-    # more than one database. Trigram FTS keeps the contains lookup fast while
-    # all databases are queried in parallel. No gender condition is applied.
-    if name_only:
-        items_to_query = primary_items
-        result, errors = aggregate(items_to_query, False)
-        if not result and routed_items and len(routed_items) < len(all_items):
-            result2, errors2 = aggregate(all_items, False)
-            errors.extend(errors2)
-            result = result2
-            items_to_query = all_items
-
-        def name_rank(row):
-            row_name=str(row.get('name') or '').strip()
-            if row_name == name:
-                rank=0
-            elif row_name.startswith(name):
-                rank=1
-            else:
-                rank=2
-            return (rank, row_name)
-        result.sort(key=name_rank)
-
-        mode = ('name_trigram_all_db' if all(_name_fts_is_ready(x['id']) for x in items_to_query)
-                else 'name_contains_all_db')
-        return {'ok':True,'count':len(result),'results':result,'errors':errors,
-                'search_mode':mode,
-                'route_cache_hit':bool(routed_items),'databases_queried':len(items_to_query)}
-
-    # Single parent-name searches use the same completeness rule as nickname
-    # search: query every enabled DB in parallel, with trigram FTS when ready.
-    if father_only or mother_only:
-        items_to_query = primary_items
-        result, errors = aggregate(items_to_query, False)
-        if not result and routed_items and len(routed_items) < len(all_items):
-            result2, errors2 = aggregate(all_items, False)
-            errors.extend(errors2)
-            result = result2
-            items_to_query = all_items
-        field='father_name' if father_only else 'mother_name'
-        needle=father if father_only else mother
-        def parent_rank(row):
-            value=str(row.get(field) or '').strip()
-            if value == needle:
-                rank=0
-            elif value.startswith(needle):
-                rank=1
-            else:
-                rank=2
-            return (rank,value)
-        result.sort(key=parent_rank)
-        mode=('father_trigram_all_db' if father_only else 'mother_trigram_all_db')
-        if not all(_aux_fts_is_ready(x['id']) for x in items_to_query):
-            mode=('father_contains_all_db' if father_only else 'mother_contains_all_db')
-        return {'ok':True,'count':len(result),'results':result,'errors':errors,
-                'search_mode':mode,'route_cache_hit':bool(routed_items),
-                'databases_queried':len(items_to_query)}
-
-    # DOB-only accepts either a complete date or just a year. The FTS year
-    # lookup narrows candidates quickly; Python normalization then guarantees
-    # DD/MM/YYYY and YYYY-MM-DD style dates compare as the same birthday.
-    if dob_only:
-        items_to_query = primary_items
-        result, errors = aggregate(items_to_query, False)
-        if not result and routed_items and len(routed_items) < len(all_items):
-            result2, errors2 = aggregate(all_items, False)
-            errors.extend(errors2)
-            result = result2
-            items_to_query = all_items
-        mode=('dob_trigram_all_db' if all(_aux_fts_is_ready(x['id']) for x in items_to_query)
-              else 'dob_contains_all_db')
-        return {'ok':True,'count':len(result),'results':result,'errors':errors,
-                'search_mode':mode,'route_cache_hit':bool(routed_items),
-                'databases_queried':len(items_to_query)}
-
-    # Other partial searches retain V9.6 compatibility and routing behavior.
-    exact = False if detail_count else True
-    result,errors=aggregate(primary_items,exact)
-    if result:
-        mode = ('routed_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area'))
-        return {'ok':True,'count':len(result),'results':result,'errors':errors,
-                'search_mode':mode,
-                'route_cache_hit':bool(routed_items),'databases_queried':len(primary_items)}
-    if routed_items and len(routed_items) < len(all_items):
-        result2,errors2=aggregate(all_items,exact)
-        errors.extend(errors2)
-        result=result2
-    mode = ('route_fallback_partial' if routed_items else ('aggregate_partial' if detail_count else 'aggregate_area'))
-    return {'ok':True,'count':len(result),'results':result,'errors':errors,
-            'search_mode':mode,
-            'route_cache_hit':bool(routed_items),'databases_queried':len(all_items) if routed_items else len(primary_items)}
+    rows=dedupe(rows); rows.sort(key=result_rank)
+    readiness=[]
+    if name and len(name)>=3: readiness.append(all(_name_fts_is_ready(x['id']) for x in items_to_query))
+    if (father and len(father)>=3) or (mother and len(mother)>=3) or (dob and _parse_dob_query(dob)[0]): readiness.append(all(_aux_fts_is_ready(x['id']) for x in items_to_query))
+    if (village and len(village)>=3) or (ward and len(ward)>=3): readiness.append(all(_geo_fts_is_ready(x['id']) for x in items_to_query))
+    indexed=all(readiness) if readiness else False
+    mode=('v21_trigram_complete' if indexed else 'v21_complete_fallback') if detail_count else ('v21_area_route' if routed_items else 'v21_area_all_db')
+    return {'ok':True,'count':len(rows),'results':rows,'errors':errors,'search_mode':mode,'route_cache_hit':bool(routed_items),'databases_queried':len(items_to_query)}
 
 async def read_pdf(file:UploadFile):
     data=await file.read()
