@@ -11,7 +11,7 @@ from firebase_admin import auth, credentials
 
 from .parser import parse_pdf_bytes
 
-APP_NAME = 'SV Tech Backend V21.2'
+APP_NAME = 'SV Tech Backend V21.3'
 MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
 
 # Preview -> upload usually happens immediately with the same PDF.  Cache parsed
@@ -587,10 +587,14 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='21.2.0')
+app = FastAPI(title=APP_NAME, version='21.3.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
+
+@app.api_route('/', methods=['GET', 'HEAD'], include_in_schema=False)
+def health_root():
+    return {'status': 'ok', 'service': APP_NAME, 'version': '21.3.0'}
 
 @app.on_event('startup')
 def _warm_background_caches():
