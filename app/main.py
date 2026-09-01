@@ -1099,7 +1099,7 @@ def turso_delete_records(database_id:str='', district:str='', upazila:str='', us
 
 @app.get('/public/search')
 def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',village:str='',ward:str='', user=Depends(current_user)):
-    """V21.4 fast area-routed search with Name/Parent + Village/Ward filters."""
+    """V21.5 fast area-routed search with Name/Parent + Village/Ward filters."""
     started=time.perf_counter()
     district=' '.join(str(district or '').split()); upazila=' '.join(str(upazila or '').split())
     name=unicodedata.normalize('NFC',' '.join(str(name or '').split()))
@@ -1158,13 +1158,23 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                 else:
                     sql+=' AND (instr(r.address,?)>0 OR instr(r.voter_area,?)>0)'; args.extend([village,village])
             if ward:
+                # V21.5: treat 1/01, 2/02 ... as the same ward without a table scan.
+                # Keep an indexed IN lookup and support both ASCII and Bangla digits.
                 ward_ascii=_ascii_digits(ward).strip()
-                ward_bn=ward_ascii.translate(_ASCII_TO_BN)
                 ward_variants=[]
-                for value in (ward,ward_ascii,ward_bn):
+                numeric_variants=[]
+                if ward_ascii.isdigit():
+                    n=str(int(ward_ascii))
+                    numeric_variants.extend((n, n.zfill(2)))
+                else:
+                    numeric_variants.append(ward_ascii)
+                for value in (ward, *numeric_variants):
                     value=str(value or '').strip()
                     if value and value not in ward_variants:
                         ward_variants.append(value)
+                    bn=value.translate(_ASCII_TO_BN)
+                    if bn and bn not in ward_variants:
+                        ward_variants.append(bn)
                 marks=','.join('?' for _ in ward_variants)
                 sql+=f' AND r.ward_no IN ({marks})'
                 args.extend(ward_variants)
