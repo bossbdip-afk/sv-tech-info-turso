@@ -1014,21 +1014,15 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     def exact_first(items):
         if not items:
             return [], []
-        pool=ThreadPoolExecutor(max_workers=max(1,min(len(items),5)))
-        futures=[pool.submit(search_one,item,True) for item in items]
-        errors=[]
-        try:
+        rows = []; errors = []
+        workers = max(1, min(len(items), 5))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(search_one, item, True) for item in items]
             for fut in as_completed(futures):
-                found,err=fut.result()
+                found, err = fut.result()
+                if found: rows.extend(found)
                 if err: errors.append(err)
-                if found:
-                    for other in futures:
-                        if other is not fut: other.cancel()
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    return dedupe(found), errors
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-        return [], errors
+        return dedupe(rows), errors
 
     def aggregate(items, exact):
         rows=[]; errors=[]
@@ -1048,7 +1042,20 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     # subset of the same contains query, so the old 1-2 second exact behavior
     # is preserved without returning only the first database's match.
     if detail_count >= 2:
+        exact_res, exact_errs = exact_first(primary_items)
+        if exact_res:
+            return {'ok':True,'count':len(exact_res),'results':exact_res,'errors':exact_errs,
+                    'search_mode':'exact_first_fast','route_cache_hit':bool(routed_items),
+                    'databases_queried':len(primary_items)}
+        if routed_items and len(routed_items) < len(all_items):
+            exact_res2, exact_errs2 = exact_first(all_items)
+            exact_errs.extend(exact_errs2)
+            if exact_res2:
+                return {'ok':True,'count':len(exact_res2),'results':exact_res2,'errors':exact_errs,
+                        'search_mode':'exact_first_fallback','route_cache_hit':bool(routed_items),
+                        'databases_queried':len(all_items)}
         result,errors=aggregate(all_items,False)
+        errors = exact_errs + errors
         need_name_fts = bool(name) and len(name) >= 3
         need_aux_fts = bool(
             (father and len(father) >= 3) or
@@ -1069,11 +1076,14 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     # more than one database. Trigram FTS keeps the contains lookup fast while
     # all databases are queried in parallel. No gender condition is applied.
     if name_only:
-        result,errors=aggregate(all_items,False)
+        items_to_query = primary_items
+        result, errors = aggregate(items_to_query, False)
+        if not result and routed_items and len(routed_items) < len(all_items):
+            result2, errors2 = aggregate(all_items, False)
+            errors.extend(errors2)
+            result = result2
+            items_to_query = all_items
 
-        # Futures complete in arbitrary order, so apply one global relevance
-        # ordering after dedupe: exact name first, then prefix, then contains.
-        # This changes presentation only; every valid contains match is kept.
         def name_rank(row):
             row_name=str(row.get('name') or '').strip()
             if row_name == name:
@@ -1085,16 +1095,22 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             return (rank, row_name)
         result.sort(key=name_rank)
 
-        mode = ('name_trigram_all_db' if all(_name_fts_is_ready(x['id']) for x in all_items)
+        mode = ('name_trigram_all_db' if all(_name_fts_is_ready(x['id']) for x in items_to_query)
                 else 'name_contains_all_db')
         return {'ok':True,'count':len(result),'results':result,'errors':errors,
                 'search_mode':mode,
-                'route_cache_hit':bool(routed_items),'databases_queried':len(all_items)}
+                'route_cache_hit':bool(routed_items),'databases_queried':len(items_to_query)}
 
     # Single parent-name searches use the same completeness rule as nickname
     # search: query every enabled DB in parallel, with trigram FTS when ready.
     if father_only or mother_only:
-        result,errors=aggregate(all_items,False)
+        items_to_query = primary_items
+        result, errors = aggregate(items_to_query, False)
+        if not result and routed_items and len(routed_items) < len(all_items):
+            result2, errors2 = aggregate(all_items, False)
+            errors.extend(errors2)
+            result = result2
+            items_to_query = all_items
         field='father_name' if father_only else 'mother_name'
         needle=father if father_only else mother
         def parent_rank(row):
@@ -1108,22 +1124,28 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             return (rank,value)
         result.sort(key=parent_rank)
         mode=('father_trigram_all_db' if father_only else 'mother_trigram_all_db')
-        if not all(_aux_fts_is_ready(x['id']) for x in all_items):
+        if not all(_aux_fts_is_ready(x['id']) for x in items_to_query):
             mode=('father_contains_all_db' if father_only else 'mother_contains_all_db')
         return {'ok':True,'count':len(result),'results':result,'errors':errors,
                 'search_mode':mode,'route_cache_hit':bool(routed_items),
-                'databases_queried':len(all_items)}
+                'databases_queried':len(items_to_query)}
 
     # DOB-only accepts either a complete date or just a year. The FTS year
     # lookup narrows candidates quickly; Python normalization then guarantees
     # DD/MM/YYYY and YYYY-MM-DD style dates compare as the same birthday.
     if dob_only:
-        result,errors=aggregate(all_items,False)
-        mode=('dob_trigram_all_db' if all(_aux_fts_is_ready(x['id']) for x in all_items)
+        items_to_query = primary_items
+        result, errors = aggregate(items_to_query, False)
+        if not result and routed_items and len(routed_items) < len(all_items):
+            result2, errors2 = aggregate(all_items, False)
+            errors.extend(errors2)
+            result = result2
+            items_to_query = all_items
+        mode=('dob_trigram_all_db' if all(_aux_fts_is_ready(x['id']) for x in items_to_query)
               else 'dob_contains_all_db')
         return {'ok':True,'count':len(result),'results':result,'errors':errors,
                 'search_mode':mode,'route_cache_hit':bool(routed_items),
-                'databases_queried':len(all_items)}
+                'databases_queried':len(items_to_query)}
 
     # Other partial searches retain V9.6 compatibility and routing behavior.
     exact = False if detail_count else True
