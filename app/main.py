@@ -1,4 +1,4 @@
-import hashlib, json, os, re, time
+import hashlib, json, os, re, time, unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from threading import Lock, Thread
@@ -11,7 +11,7 @@ from firebase_admin import auth, credentials
 
 from .parser import parse_pdf_bytes
 
-APP_NAME = 'SV Tech Backend V21.1'
+APP_NAME = 'SV Tech Backend V21.2'
 MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
 
 # Preview -> upload usually happens immediately with the same PDF.  Cache parsed
@@ -38,6 +38,26 @@ _NAME_FTS_READY = set()
 _NAME_FTS_FAILED = set()
 _NAME_FTS_LOCK = Lock()
 NAME_FTS_VERSION = 'name-trigram-v1'
+
+# V21.2 token index for Bangladeshi personal names. unicode61 indexes complete
+# name-parts (first/middle/last/surname) instead of scanning the voter table.
+_PERSON_FTS_READY = set()
+_PERSON_FTS_FAILED = set()
+_PERSON_FTS_LOCK = Lock()
+PERSON_FTS_VERSION = 'person-token-v1'
+
+# Conservative spelling aliases for common Bengali name-parts.
+_NAME_ALIAS_GROUPS = (
+    ('মিয়া', 'মিয়া', 'মিঞা'),
+    ('আলী', 'আলি'),
+    ('হোসেন', 'হোসাইন'),
+    ('উদ্দিন', 'উদ্দীন'),
+)
+_NAME_ALIAS_MAP = {}
+for _group in _NAME_ALIAS_GROUPS:
+    _clean_group = tuple(dict.fromkeys(unicodedata.normalize('NFC', x) for x in _group))
+    for _token in _clean_group:
+        _NAME_ALIAS_MAP[_token] = _clean_group
 
 # Search-only trigram index for father name, mother name, and birth date.
 # It is kept separate from the voter table and maintained by triggers so
@@ -128,6 +148,10 @@ def _name_fts_is_ready(database_id: str) -> bool:
     with _NAME_FTS_LOCK:
         return str(database_id) in _NAME_FTS_READY
 
+def _person_fts_is_ready(database_id: str) -> bool:
+    with _PERSON_FTS_LOCK:
+        return str(database_id) in _PERSON_FTS_READY
+
 def _aux_fts_is_ready(database_id: str) -> bool:
     with _AUX_FTS_LOCK:
         return str(database_id) in _AUX_FTS_READY
@@ -149,14 +173,15 @@ def _probe_fts_ready_on_conn(conn, database_id: str):
     if not dbid:
         return
     need_name = not _name_fts_is_ready(dbid)
+    need_person = not _person_fts_is_ready(dbid)
     need_aux = not _aux_fts_is_ready(dbid)
     need_geo = not _geo_fts_is_ready(dbid)
-    if not (need_name or need_aux or need_geo):
+    if not (need_name or need_person or need_aux or need_geo):
         return
     try:
         rows = conn.execute(
-            "SELECT key FROM search_index_meta WHERE key IN (?,?,?)",
-            (NAME_FTS_VERSION, AUX_FTS_VERSION, GEO_FTS_VERSION),
+            "SELECT key FROM search_index_meta WHERE key IN (?,?,?,?)",
+            (NAME_FTS_VERSION, PERSON_FTS_VERSION, AUX_FTS_VERSION, GEO_FTS_VERSION),
         ).fetchall()
     except Exception:
         return
@@ -164,6 +189,9 @@ def _probe_fts_ready_on_conn(conn, database_id: str):
     if NAME_FTS_VERSION in keys:
         with _NAME_FTS_LOCK:
             _NAME_FTS_READY.add(dbid); _NAME_FTS_FAILED.discard(dbid)
+    if PERSON_FTS_VERSION in keys:
+        with _PERSON_FTS_LOCK:
+            _PERSON_FTS_READY.add(dbid); _PERSON_FTS_FAILED.discard(dbid)
     if AUX_FTS_VERSION in keys:
         with _AUX_FTS_LOCK:
             _AUX_FTS_READY.add(dbid); _AUX_FTS_FAILED.discard(dbid)
@@ -314,6 +342,101 @@ def _ensure_name_search_index(item):
             try: conn.close()
             except Exception: pass
 
+def _name_tokens(value: str):
+    """Canonical Unicode word tokens used for person-name search/ranking."""
+    text = unicodedata.normalize('NFC', str(value or ''))
+    text = text.replace('\u200c', '').replace('\u200d', '').replace('\ufeff', '')
+    text = ''.join(ch if (ch.isalnum() or unicodedata.category(ch).startswith('M')) else ' ' for ch in text)
+    return [x for x in text.split() if x]
+
+
+def _token_aliases(token: str):
+    token = unicodedata.normalize('NFC', str(token or '').strip())
+    return _NAME_ALIAS_MAP.get(token, (token,)) if token else ()
+
+
+def _fts_quote(value: str):
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _person_field_match(column: str, value: str):
+    """Build FTS5 expression requiring every supplied name-part in one field."""
+    tokens = _name_tokens(value)
+    if not tokens:
+        return ''
+    groups = []
+    for token in tokens:
+        variants = tuple(dict.fromkeys(_token_aliases(token)))
+        alts = ' OR '.join(f'{column}:{_fts_quote(v)}' for v in variants)
+        groups.append('(' + alts + ')')
+    return ' AND '.join(groups)
+
+
+def _person_match_query(name: str = '', father: str = '', mother: str = ''):
+    parts = []
+    for column, value in (('name', name), ('father_name', father), ('mother_name', mother)):
+        expr = _person_field_match(column, value)
+        if expr:
+            parts.append('(' + expr + ')')
+    return ' AND '.join(parts)
+
+
+def _token_value_matches(value: str, query: str):
+    if not query:
+        return True
+    value_tokens = set(_name_tokens(value))
+    for q in _name_tokens(query):
+        if not any(alias in value_tokens for alias in _token_aliases(q)):
+            return False
+    return True
+
+
+def _ensure_person_search_index(item):
+    """Create/backfill V21.2 unicode word-token index for name/father/mother."""
+    dbid = str(item.get('id', ''))
+    with _PERSON_FTS_LOCK:
+        if dbid in _PERSON_FTS_READY:
+            return True
+        if dbid in _PERSON_FTS_FAILED:
+            return False
+    conn = None
+    try:
+        conn = connect_item(item, ensure=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS search_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')")
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_person_fts USING fts5(name,father_name,mother_name, tokenize='unicode61')")
+        conn.execute("""CREATE TRIGGER IF NOT EXISTS records_person_fts_ai AFTER INSERT ON records BEGIN
+            INSERT INTO records_person_fts(rowid,name,father_name,mother_name)
+            VALUES (new.rowid,COALESCE(new.name,''),COALESCE(new.father_name,''),COALESCE(new.mother_name,''));
+        END""")
+        conn.execute("""CREATE TRIGGER IF NOT EXISTS records_person_fts_ad AFTER DELETE ON records BEGIN
+            DELETE FROM records_person_fts WHERE rowid=old.rowid;
+        END""")
+        conn.execute("""CREATE TRIGGER IF NOT EXISTS records_person_fts_au AFTER UPDATE ON records BEGIN
+            DELETE FROM records_person_fts WHERE rowid=old.rowid;
+            INSERT INTO records_person_fts(rowid,name,father_name,mother_name)
+            VALUES (new.rowid,COALESCE(new.name,''),COALESCE(new.father_name,''),COALESCE(new.mother_name,''));
+        END""")
+        marker = conn.execute("SELECT value FROM search_index_meta WHERE key=?", (PERSON_FTS_VERSION,)).fetchone()
+        if not marker:
+            conn.execute('DELETE FROM records_person_fts')
+            conn.execute("INSERT INTO records_person_fts(rowid,name,father_name,mother_name) SELECT rowid,COALESCE(name,''),COALESCE(father_name,''),COALESCE(mother_name,'') FROM records")
+            conn.execute("INSERT OR REPLACE INTO search_index_meta(key,value) VALUES (?,?)",
+                         (PERSON_FTS_VERSION, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        with _PERSON_FTS_LOCK:
+            _PERSON_FTS_READY.add(dbid)
+            _PERSON_FTS_FAILED.discard(dbid)
+        return True
+    except Exception:
+        with _PERSON_FTS_LOCK:
+            _PERSON_FTS_FAILED.add(dbid)
+        return False
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
+
+
 def _ensure_aux_search_index(item):
     """Create/backfill the parent-name and DOB trigram index once per DB."""
     dbid=str(item.get('id',''))
@@ -400,9 +523,13 @@ def _rebuild_name_search_indexes():
         return
     # Keep startup/network pressure modest; index construction is server-side.
     def build(item):
+        # Existing indexes are normally already persisted from V21.1; mark them
+        # ready first so searches stay fast while the new person-token index is
+        # backfilled once in the background.
         _ensure_name_search_index(item)
         _ensure_aux_search_index(item)
         _ensure_geo_search_index(item)
+        _ensure_person_search_index(item)
     with ThreadPoolExecutor(max_workers=max(1, min(len(items), 2))) as pool:
         list(pool.map(build, items))
 
@@ -460,7 +587,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='21.1.0')
+app = FastAPI(title=APP_NAME, version='21.2.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -964,56 +1091,59 @@ def turso_delete_records(database_id:str='', district:str='', upazila:str='', us
 
 @app.get('/public/search')
 def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str='',village:str='',ward:str='', user=Depends(current_user)):
-    """V21.1 area-routed complete multi-field search."""
+    """V21.2 token-first, area-routed search for Bangladeshi names."""
     started=time.perf_counter()
     district=' '.join(str(district or '').split()); upazila=' '.join(str(upazila or '').split())
-    name=' '.join(str(name or '').split()); father=' '.join(str(father or '').split())
-    mother=' '.join(str(mother or '').split()); dob=' '.join(str(dob or '').split())
-    village=' '.join(str(village or '').split()); ward=' '.join(str(ward or '').split())
+    name=unicodedata.normalize('NFC',' '.join(str(name or '').split()))
+    father=unicodedata.normalize('NFC',' '.join(str(father or '').split()))
+    mother=unicodedata.normalize('NFC',' '.join(str(mother or '').split()))
+    dob=' '.join(str(dob or '').split()); village=' '.join(str(village or '').split()); ward=' '.join(str(ward or '').split())
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
     all_items=turso_catalog(False)
     detail_count=sum(bool(x) for x in (name,father,mother,dob,village,ward))
 
-    # First identify exactly which DBs contain this district/upazila. This is a
-    # tiny indexed lookup and prevents nickname/parent searches from touching
-    # unrelated remote databases.
     area_items,route_cache_complete=_resolve_area_items(all_items,district,upazila)
     items_to_query=area_items
     if not items_to_query:
         return {'ok':True,'count':0,'results':[],'errors':[],
-                'search_mode':'v21_1_area_empty','route_cache_hit':route_cache_complete,
+                'search_mode':'v21_2_area_empty','route_cache_hit':route_cache_complete,
                 'databases_queried':0,'elapsed_ms':round((time.perf_counter()-started)*1000)}
 
     def phrase(value): return '"'+str(value).replace('"','""')+'"'
+    person_query=_person_match_query(name,father,mother)
 
     def search_one(item):
         conn=None
         try:
             conn=connect_item(item, ensure=False)
-            # Persisted FTS indexes survive deploys; only the in-memory flags do
-            # not. Probe their markers on the same connection before deciding
-            # whether to use a full-scan fallback.
             _probe_fts_ready_on_conn(conn,item['id'])
             dob_year,_=_parse_dob_query(dob) if dob else ('','')
+            person_ready=bool(person_query) and _person_fts_is_ready(item['id'])
             use_name=bool(name) and len(name)>=3 and _name_fts_is_ready(item['id'])
             use_aux=_aux_fts_is_ready(item['id']) and bool((father and len(father)>=3) or (mother and len(mother)>=3) or (dob and dob_year))
             use_geo=_geo_fts_is_ready(item['id']) and bool((village and len(village)>=3) or (ward and len(ward)>=3))
 
             sql='SELECT r.data_json FROM records AS r WHERE r.district_name=? AND r.upazila_name=?'; args=[district,upazila]
-            # IN(rowid subquery) keeps each FTS table independent and lets
-            # SQLite narrow the candidate set before the compatibility checks.
-            if name:
-                if use_name:
-                    sql+=' AND r.rowid IN (SELECT rowid FROM records_name_fts WHERE name MATCH ?)'; args.append(phrase(name))
-                sql+=' AND instr(r.name,?)>0'; args.append(name)
-            if father:
-                if use_aux and len(father)>=3:
-                    sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE father_name MATCH ?)'; args.append(phrase(father))
-                sql+=' AND instr(r.father_name,?)>0'; args.append(father)
-            if mother:
-                if use_aux and len(mother)>=3:
-                    sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE mother_name MATCH ?)'; args.append(phrase(mother))
-                sql+=' AND instr(r.mother_name,?)>0'; args.append(mother)
+            if person_query and person_ready:
+                sql+=' AND r.rowid IN (SELECT rowid FROM records_person_fts WHERE records_person_fts MATCH ?)'
+                args.append(person_query)
+            else:
+                if name:
+                    if use_name:
+                        sql+=' AND r.rowid IN (SELECT rowid FROM records_name_fts WHERE name MATCH ?)'; args.append(phrase(name))
+                    else:
+                        sql+=' AND instr(r.name,?)>0'; args.append(name)
+                if father:
+                    if use_aux and len(father)>=3:
+                        sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE father_name MATCH ?)'; args.append(phrase(father))
+                    else:
+                        sql+=' AND instr(r.father_name,?)>0'; args.append(father)
+                if mother:
+                    if use_aux and len(mother)>=3:
+                        sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE mother_name MATCH ?)'; args.append(phrase(mother))
+                    else:
+                        sql+=' AND instr(r.mother_name,?)>0'; args.append(mother)
+
             if dob:
                 if use_aux and dob_year:
                     sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE birth_date MATCH ?)'; args.append(_fts_year_query(dob_year))
@@ -1022,11 +1152,13 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             if village:
                 if use_geo and len(village)>=3:
                     sql+=' AND r.rowid IN (SELECT rowid FROM records_geo_fts WHERE records_geo_fts MATCH ?)'; args.append(phrase(village))
-                sql+=' AND (instr(r.address,?)>0 OR instr(r.voter_area,?)>0)'; args.extend([village,village])
+                else:
+                    sql+=' AND (instr(r.address,?)>0 OR instr(r.voter_area,?)>0)'; args.extend([village,village])
             if ward:
                 if use_geo and len(ward)>=3:
                     sql+=' AND r.rowid IN (SELECT rowid FROM records_geo_fts WHERE ward_no MATCH ?)'; args.append(phrase(ward))
-                sql+=' AND instr(r.ward_no,?)>0'; args.append(ward)
+                else:
+                    sql+=' AND instr(r.ward_no,?)>0'; args.append(ward)
             if not detail_count: sql+=' LIMIT 500'
 
             found=[]
@@ -1034,7 +1166,8 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                 d=record_from_db(raw)
                 if dob and not _dob_matches(d.get('birth_date',''),dob): continue
                 d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
-            return found,None,{'database_id':item['id'],'indexed':bool(use_name or use_aux or use_geo)}
+            indexed = person_ready or use_name or use_aux or use_geo
+            return found,None,{'database_id':item['id'],'indexed':bool(indexed),'person_token_index':bool(person_ready)}
         except Exception as exc:
             return [],{'database_id':item['id'],'error':type(exc).__name__},None
         finally:
@@ -1051,10 +1184,11 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
 
     def one_rank(value,needle):
         if not needle: return 0
-        value=' '.join(str(value or '').split())
+        value=unicodedata.normalize('NFC',' '.join(str(value or '').split()))
+        needle=unicodedata.normalize('NFC',' '.join(str(needle or '').split()))
         if value==needle: return 0
         if value.startswith(needle): return 1
-        if needle in value.split(): return 2
+        if _token_value_matches(value,needle): return 2
         if needle in value: return 3
         return 20
 
@@ -1075,7 +1209,8 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             if diag: diagnostics.append(diag)
     rows=dedupe(rows); rows.sort(key=result_rank)
     all_indexed=bool(diagnostics) and all(x.get('indexed') for x in diagnostics)
-    mode='v21_1_area_fts' if detail_count and all_indexed else ('v21_1_area_fallback' if detail_count else 'v21_1_area_only')
+    person_indexed=bool(person_query) and bool(diagnostics) and all(x.get('person_token_index') for x in diagnostics)
+    mode='v21_2_person_token' if person_indexed else ('v21_2_area_fts' if detail_count and all_indexed else ('v21_2_area_fallback' if detail_count else 'v21_2_area_only'))
     return {'ok':True,'count':len(rows),'results':rows,'errors':errors,'search_mode':mode,
             'route_cache_hit':route_cache_complete,'databases_queried':len(items_to_query),
             'elapsed_ms':round((time.perf_counter()-started)*1000)}
