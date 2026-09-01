@@ -11,7 +11,7 @@ from firebase_admin import auth, credentials
 
 from .parser import parse_pdf_bytes
 
-APP_NAME = 'SV Tech Backend V21'
+APP_NAME = 'SV Tech Backend V21.1'
 MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
 
 # Preview -> upload usually happens immediately with the same PDF.  Cache parsed
@@ -135,6 +135,81 @@ def _aux_fts_is_ready(database_id: str) -> bool:
 def _geo_fts_is_ready(database_id: str) -> bool:
     with _GEO_FTS_LOCK:
         return str(database_id) in _GEO_FTS_READY
+
+
+def _probe_fts_ready_on_conn(conn, database_id: str):
+    """Load persisted FTS readiness markers using one cheap remote query.
+
+    After a deploy the in-memory READY sets start empty even though the Turso
+    FTS tables are already built. Without this probe, the first public searches
+    fall back to expensive instr() scans until the background warmer reaches
+    that database.
+    """
+    dbid = str(database_id or '')
+    if not dbid:
+        return
+    need_name = not _name_fts_is_ready(dbid)
+    need_aux = not _aux_fts_is_ready(dbid)
+    need_geo = not _geo_fts_is_ready(dbid)
+    if not (need_name or need_aux or need_geo):
+        return
+    try:
+        rows = conn.execute(
+            "SELECT key FROM search_index_meta WHERE key IN (?,?,?)",
+            (NAME_FTS_VERSION, AUX_FTS_VERSION, GEO_FTS_VERSION),
+        ).fetchall()
+    except Exception:
+        return
+    keys = {str(r[0]) for r in rows}
+    if NAME_FTS_VERSION in keys:
+        with _NAME_FTS_LOCK:
+            _NAME_FTS_READY.add(dbid); _NAME_FTS_FAILED.discard(dbid)
+    if AUX_FTS_VERSION in keys:
+        with _AUX_FTS_LOCK:
+            _AUX_FTS_READY.add(dbid); _AUX_FTS_FAILED.discard(dbid)
+    if GEO_FTS_VERSION in keys:
+        with _GEO_FTS_LOCK:
+            _GEO_FTS_READY.add(dbid); _GEO_FTS_FAILED.discard(dbid)
+
+
+def _resolve_area_items(all_items, district: str, upazila: str):
+    """Return every configured DB that actually contains the selected area.
+
+    The area probe uses the existing (district_name, upazila_name) B-tree index,
+    so it is much cheaper than running a partial-name scan against every DB.
+    Results are cached for later searches. This keeps completeness even when the
+    global route-cache warmer has not finished yet.
+    """
+    item_by_id = {str(x['id']): x for x in all_items}
+    routed_ids = _route_get(district, upazila)
+    if _AREA_ROUTE_READY and routed_ids:
+        return [item_by_id[x] for x in routed_ids if x in item_by_id], True
+
+    def has_area(item):
+        conn = None
+        try:
+            conn = connect_item(item, ensure=False)
+            row = conn.execute(
+                "SELECT 1 FROM records WHERE district_name=? AND upazila_name=? LIMIT 1",
+                (district, upazila),
+            ).fetchone()
+            return item if row else None
+        except Exception:
+            return None
+        finally:
+            if conn is not None:
+                try: conn.close()
+                except Exception: pass
+
+    found = []
+    if all_items:
+        workers = max(1, min(len(all_items), SEARCH_WORKERS))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for item in pool.map(has_area, all_items):
+                if item is not None:
+                    found.append(item)
+                    _route_add(district, upazila, item['id'])
+    return found, False
 
 def _ascii_digits(value: str) -> str:
     return str(value or '').translate(_BN_TO_ASCII)
@@ -385,7 +460,7 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='21.0.0')
+app = FastAPI(title=APP_NAME, version='21.1.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
@@ -889,17 +964,25 @@ def turso_delete_records(database_id:str='', district:str='', upazila:str='', us
 
 @app.get('/public/search')
 def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str='',village:str='',ward:str='', user=Depends(current_user)):
-    """V21 complete multi-field search across every enabled Turso database."""
+    """V21.1 area-routed complete multi-field search."""
+    started=time.perf_counter()
     district=' '.join(str(district or '').split()); upazila=' '.join(str(upazila or '').split())
     name=' '.join(str(name or '').split()); father=' '.join(str(father or '').split())
     mother=' '.join(str(mother or '').split()); dob=' '.join(str(dob or '').split())
     village=' '.join(str(village or '').split()); ward=' '.join(str(ward or '').split())
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
     all_items=turso_catalog(False)
-    item_by_id={x['id']:x for x in all_items}
-    routed_ids=_route_get(district,upazila)
-    routed_items=[item_by_id[x] for x in routed_ids if x in item_by_id]
     detail_count=sum(bool(x) for x in (name,father,mother,dob,village,ward))
+
+    # First identify exactly which DBs contain this district/upazila. This is a
+    # tiny indexed lookup and prevents nickname/parent searches from touching
+    # unrelated remote databases.
+    area_items,route_cache_complete=_resolve_area_items(all_items,district,upazila)
+    items_to_query=area_items
+    if not items_to_query:
+        return {'ok':True,'count':0,'results':[],'errors':[],
+                'search_mode':'v21_1_area_empty','route_cache_hit':route_cache_complete,
+                'databases_queried':0,'elapsed_ms':round((time.perf_counter()-started)*1000)}
 
     def phrase(value): return '"'+str(value).replace('"','""')+'"'
 
@@ -907,43 +990,53 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
         conn=None
         try:
             conn=connect_item(item, ensure=False)
+            # Persisted FTS indexes survive deploys; only the in-memory flags do
+            # not. Probe their markers on the same connection before deciding
+            # whether to use a full-scan fallback.
+            _probe_fts_ready_on_conn(conn,item['id'])
             dob_year,_=_parse_dob_query(dob) if dob else ('','')
             use_name=bool(name) and len(name)>=3 and _name_fts_is_ready(item['id'])
             use_aux=_aux_fts_is_ready(item['id']) and bool((father and len(father)>=3) or (mother and len(mother)>=3) or (dob and dob_year))
             use_geo=_geo_fts_is_ready(item['id']) and bool((village and len(village)>=3) or (ward and len(ward)>=3))
-            sql='SELECT r.data_json FROM records AS r'; args=[]
-            if use_name: sql+=' JOIN records_name_fts AS nf ON nf.rowid=r.rowid'
-            if use_aux: sql+=' JOIN records_aux_fts AS af ON af.rowid=r.rowid'
-            if use_geo: sql+=' JOIN records_geo_fts AS gf ON gf.rowid=r.rowid'
-            sql+=' WHERE r.district_name=? AND r.upazila_name=?'; args.extend([district,upazila])
+
+            sql='SELECT r.data_json FROM records AS r WHERE r.district_name=? AND r.upazila_name=?'; args=[district,upazila]
+            # IN(rowid subquery) keeps each FTS table independent and lets
+            # SQLite narrow the candidate set before the compatibility checks.
             if name:
-                if use_name: sql+=' AND nf.name MATCH ?'; args.append(phrase(name))
+                if use_name:
+                    sql+=' AND r.rowid IN (SELECT rowid FROM records_name_fts WHERE name MATCH ?)'; args.append(phrase(name))
                 sql+=' AND instr(r.name,?)>0'; args.append(name)
             if father:
-                if use_aux and len(father)>=3: sql+=' AND af.father_name MATCH ?'; args.append(phrase(father))
+                if use_aux and len(father)>=3:
+                    sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE father_name MATCH ?)'; args.append(phrase(father))
                 sql+=' AND instr(r.father_name,?)>0'; args.append(father)
             if mother:
-                if use_aux and len(mother)>=3: sql+=' AND af.mother_name MATCH ?'; args.append(phrase(mother))
+                if use_aux and len(mother)>=3:
+                    sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE mother_name MATCH ?)'; args.append(phrase(mother))
                 sql+=' AND instr(r.mother_name,?)>0'; args.append(mother)
             if dob:
-                if use_aux and dob_year: sql+=' AND af.birth_date MATCH ?'; args.append(_fts_year_query(dob_year))
-                else: sql+=' AND instr(r.birth_date,?)>0'; args.append(dob)
+                if use_aux and dob_year:
+                    sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE birth_date MATCH ?)'; args.append(_fts_year_query(dob_year))
+                else:
+                    sql+=' AND instr(r.birth_date,?)>0'; args.append(dob)
             if village:
-                if use_geo and len(village)>=3: sql+=' AND records_geo_fts MATCH ?'; args.append(phrase(village))
+                if use_geo and len(village)>=3:
+                    sql+=' AND r.rowid IN (SELECT rowid FROM records_geo_fts WHERE records_geo_fts MATCH ?)'; args.append(phrase(village))
                 sql+=' AND (instr(r.address,?)>0 OR instr(r.voter_area,?)>0)'; args.extend([village,village])
             if ward:
-                if use_geo and len(ward)>=3: sql+=' AND gf.ward_no MATCH ?'; args.append(phrase(ward))
+                if use_geo and len(ward)>=3:
+                    sql+=' AND r.rowid IN (SELECT rowid FROM records_geo_fts WHERE ward_no MATCH ?)'; args.append(phrase(ward))
                 sql+=' AND instr(r.ward_no,?)>0'; args.append(ward)
             if not detail_count: sql+=' LIMIT 500'
+
             found=[]
             for raw in conn.execute(sql,args).fetchall():
                 d=record_from_db(raw)
                 if dob and not _dob_matches(d.get('birth_date',''),dob): continue
                 d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
-            if found: _route_add(district,upazila,item['id'])
-            return found,None
+            return found,None,{'database_id':item['id'],'indexed':bool(use_name or use_aux or use_geo)}
         except Exception as exc:
-            return [],{'database_id':item['id'],'error':type(exc).__name__}
+            return [],{'database_id':item['id'],'error':type(exc).__name__},None
         finally:
             if conn is not None:
                 try: conn.close()
@@ -972,23 +1065,20 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
         score += one_rank(row.get('ward_no',''),ward)
         return (score,str(row.get('name') or ''),str(row.get('voter_no') or ''))
 
-    items_to_query=all_items if detail_count else (routed_items or all_items)
-    rows=[]; errors=[]
-    if items_to_query:
-        workers=max(1,min(len(items_to_query),SEARCH_WORKERS))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures=[pool.submit(search_one,item) for item in items_to_query]
-            for fut in as_completed(futures):
-                found,err=fut.result(); rows.extend(found)
-                if err: errors.append(err)
+    rows=[]; errors=[]; diagnostics=[]
+    workers=max(1,min(len(items_to_query),SEARCH_WORKERS))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures=[pool.submit(search_one,item) for item in items_to_query]
+        for fut in as_completed(futures):
+            found,err,diag=fut.result(); rows.extend(found)
+            if err: errors.append(err)
+            if diag: diagnostics.append(diag)
     rows=dedupe(rows); rows.sort(key=result_rank)
-    readiness=[]
-    if name and len(name)>=3: readiness.append(all(_name_fts_is_ready(x['id']) for x in items_to_query))
-    if (father and len(father)>=3) or (mother and len(mother)>=3) or (dob and _parse_dob_query(dob)[0]): readiness.append(all(_aux_fts_is_ready(x['id']) for x in items_to_query))
-    if (village and len(village)>=3) or (ward and len(ward)>=3): readiness.append(all(_geo_fts_is_ready(x['id']) for x in items_to_query))
-    indexed=all(readiness) if readiness else False
-    mode=('v21_trigram_complete' if indexed else 'v21_complete_fallback') if detail_count else ('v21_area_route' if routed_items else 'v21_area_all_db')
-    return {'ok':True,'count':len(rows),'results':rows,'errors':errors,'search_mode':mode,'route_cache_hit':bool(routed_items),'databases_queried':len(items_to_query)}
+    all_indexed=bool(diagnostics) and all(x.get('indexed') for x in diagnostics)
+    mode='v21_1_area_fts' if detail_count and all_indexed else ('v21_1_area_fallback' if detail_count else 'v21_1_area_only')
+    return {'ok':True,'count':len(rows),'results':rows,'errors':errors,'search_mode':mode,
+            'route_cache_hit':route_cache_complete,'databases_queried':len(items_to_query),
+            'elapsed_ms':round((time.perf_counter()-started)*1000)}
 
 async def read_pdf(file:UploadFile):
     data=await file.read()
