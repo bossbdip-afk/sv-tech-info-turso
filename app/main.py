@@ -494,6 +494,8 @@ def _ensure_geo_search_index(item):
     try:
         conn=connect_item(item, ensure=False)
         conn.execute("CREATE TABLE IF NOT EXISTS search_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_records_ward ON records(ward_no)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_records_area_ward ON records(district_name, upazila_name, ward_no)")
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_geo_fts USING fts5(address,voter_area,ward_no, tokenize='trigram')")
         conn.execute("CREATE TRIGGER IF NOT EXISTS records_geo_fts_ai AFTER INSERT ON records BEGIN INSERT INTO records_geo_fts(rowid,address,voter_area,ward_no) VALUES (new.rowid,COALESCE(new.address,''),COALESCE(new.voter_area,''),COALESCE(new.ward_no,'')); END")
         conn.execute("CREATE TRIGGER IF NOT EXISTS records_geo_fts_ad AFTER DELETE ON records BEGIN DELETE FROM records_geo_fts WHERE rowid=old.rowid; END")
@@ -587,14 +589,14 @@ def init_auth_only():
 
 init_auth_only()
 
-app = FastAPI(title=APP_NAME, version='21.3.0')
+app = FastAPI(title=APP_NAME, version='21.4.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
                    allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
 
 @app.api_route('/', methods=['GET', 'HEAD'], include_in_schema=False)
 def health_root():
-    return {'status': 'ok', 'service': APP_NAME, 'version': '21.3.0'}
+    return {'status': 'ok', 'service': APP_NAME, 'version': '21.4.0'}
 
 @app.on_event('startup')
 def _warm_background_caches():
@@ -715,6 +717,8 @@ def ensure_schema(conn):
     conn.execute('CREATE INDEX IF NOT EXISTS idx_records_area_father ON records(district_name, upazila_name, father_name)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_records_area_mother ON records(district_name, upazila_name, mother_name)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_records_area_dob ON records(district_name, upazila_name, birth_date)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_records_ward ON records(ward_no)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_records_area_ward ON records(district_name, upazila_name, ward_no)')
     conn.execute('''CREATE TABLE IF NOT EXISTS pdf_imports (
         id TEXT PRIMARY KEY, database_id TEXT, district_name TEXT, upazila_name TEXT,
         file_name TEXT, records_detected INTEGER, records_written INTEGER,
@@ -1094,17 +1098,18 @@ def turso_delete_records(database_id:str='', district:str='', upazila:str='', us
     finally: conn.close()
 
 @app.get('/public/search')
-def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',dob:str='',village:str='',ward:str='', user=Depends(current_user)):
-    """V21.2 token-first, area-routed search for Bangladeshi names."""
+def public_search(district:str='',upazila:str='',name:str='',father:str='',mother:str='',village:str='',ward:str='', user=Depends(current_user)):
+    """V21.4 fast area-routed search with Name/Parent + Village/Ward filters."""
     started=time.perf_counter()
     district=' '.join(str(district or '').split()); upazila=' '.join(str(upazila or '').split())
     name=unicodedata.normalize('NFC',' '.join(str(name or '').split()))
     father=unicodedata.normalize('NFC',' '.join(str(father or '').split()))
     mother=unicodedata.normalize('NFC',' '.join(str(mother or '').split()))
-    dob=' '.join(str(dob or '').split()); village=' '.join(str(village or '').split()); ward=' '.join(str(ward or '').split())
+    village=unicodedata.normalize('NFC',' '.join(str(village or '').split()))
+    ward=' '.join(str(ward or '').split())
     if not district or not upazila: raise HTTPException(400,'জেলা ও উপজেলা প্রয়োজন')
     all_items=turso_catalog(False)
-    detail_count=sum(bool(x) for x in (name,father,mother,dob,village,ward))
+    detail_count=sum(bool(x) for x in (name,father,mother,village,ward))
 
     area_items,route_cache_complete=_resolve_area_items(all_items,district,upazila)
     items_to_query=area_items
@@ -1121,11 +1126,10 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
         try:
             conn=connect_item(item, ensure=False)
             _probe_fts_ready_on_conn(conn,item['id'])
-            dob_year,_=_parse_dob_query(dob) if dob else ('','')
             person_ready=bool(person_query) and _person_fts_is_ready(item['id'])
             use_name=bool(name) and len(name)>=3 and _name_fts_is_ready(item['id'])
-            use_aux=_aux_fts_is_ready(item['id']) and bool((father and len(father)>=3) or (mother and len(mother)>=3) or (dob and dob_year))
-            use_geo=_geo_fts_is_ready(item['id']) and bool((village and len(village)>=3) or (ward and len(ward)>=3))
+            use_aux=_aux_fts_is_ready(item['id']) and bool((father and len(father)>=3) or (mother and len(mother)>=3))
+            use_geo=_geo_fts_is_ready(item['id']) and bool(village and len(village)>=3)
 
             sql='SELECT r.data_json FROM records AS r WHERE r.district_name=? AND r.upazila_name=?'; args=[district,upazila]
             if person_query and person_ready:
@@ -1148,29 +1152,29 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
                     else:
                         sql+=' AND instr(r.mother_name,?)>0'; args.append(mother)
 
-            if dob:
-                if use_aux and dob_year:
-                    sql+=' AND r.rowid IN (SELECT rowid FROM records_aux_fts WHERE birth_date MATCH ?)'; args.append(_fts_year_query(dob_year))
-                else:
-                    sql+=' AND instr(r.birth_date,?)>0'; args.append(dob)
             if village:
                 if use_geo and len(village)>=3:
                     sql+=' AND r.rowid IN (SELECT rowid FROM records_geo_fts WHERE records_geo_fts MATCH ?)'; args.append(phrase(village))
                 else:
                     sql+=' AND (instr(r.address,?)>0 OR instr(r.voter_area,?)>0)'; args.extend([village,village])
             if ward:
-                if use_geo and len(ward)>=3:
-                    sql+=' AND r.rowid IN (SELECT rowid FROM records_geo_fts WHERE ward_no MATCH ?)'; args.append(phrase(ward))
-                else:
-                    sql+=' AND instr(r.ward_no,?)>0'; args.append(ward)
+                ward_ascii=_ascii_digits(ward).strip()
+                ward_bn=ward_ascii.translate(_ASCII_TO_BN)
+                ward_variants=[]
+                for value in (ward,ward_ascii,ward_bn):
+                    value=str(value or '').strip()
+                    if value and value not in ward_variants:
+                        ward_variants.append(value)
+                marks=','.join('?' for _ in ward_variants)
+                sql+=f' AND r.ward_no IN ({marks})'
+                args.extend(ward_variants)
             if not detail_count: sql+=' LIMIT 500'
 
             found=[]
             for raw in conn.execute(sql,args).fetchall():
                 d=record_from_db(raw)
-                if dob and not _dob_matches(d.get('birth_date',''),dob): continue
                 d['_database_id']=item['id']; d['_database_name']=item['name']; found.append(d)
-            indexed = person_ready or use_name or use_aux or use_geo
+            indexed = person_ready or use_name or use_aux or use_geo or bool(ward)
             return found,None,{'database_id':item['id'],'indexed':bool(indexed),'person_token_index':bool(person_ready)}
         except Exception as exc:
             return [],{'database_id':item['id'],'error':type(exc).__name__},None
@@ -1198,7 +1202,6 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
 
     def result_rank(row):
         score=one_rank(row.get('name',''),name)+one_rank(row.get('father_name',''),father)+one_rank(row.get('mother_name',''),mother)
-        if dob: score += 0 if _dob_matches(row.get('birth_date',''),dob) else 20
         if village: score += min(one_rank(row.get('address',''),village),one_rank(row.get('voter_area',''),village))
         score += one_rank(row.get('ward_no',''),ward)
         return (score,str(row.get('name') or ''),str(row.get('voter_no') or ''))
@@ -1214,7 +1217,7 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
     rows=dedupe(rows); rows.sort(key=result_rank)
     all_indexed=bool(diagnostics) and all(x.get('indexed') for x in diagnostics)
     person_indexed=bool(person_query) and bool(diagnostics) and all(x.get('person_token_index') for x in diagnostics)
-    mode='v21_2_person_token' if person_indexed else ('v21_2_area_fts' if detail_count and all_indexed else ('v21_2_area_fallback' if detail_count else 'v21_2_area_only'))
+    mode='v21_4_person_token' if person_indexed else ('v21_4_area_indexed' if detail_count and all_indexed else ('v21_4_area_fallback' if detail_count else 'v21_4_area_only'))
     return {'ok':True,'count':len(rows),'results':rows,'errors':errors,'search_mode':mode,
             'route_cache_hit':route_cache_complete,'databases_queried':len(items_to_query),
             'elapsed_ms':round((time.perf_counter()-started)*1000)}
