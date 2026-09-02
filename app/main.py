@@ -1470,6 +1470,18 @@ def _pdf_infer_metadata(row: dict, district: str, upazila: str) -> dict:
     row['district_name'] = _pdf_clean_text(row.get('district_name') or district)
     row['upazila_name'] = _pdf_clean_text(row.get('upazila_name') or upazila)
 
+    # Some legacy PDF extraction drops the final administrative suffix from
+    # a post-office token (observed: 'ইসলামপুর' -> 'ইসলাম').  Repair only
+    # when the truncated value exactly equals the selected/clean upazila name
+    # with a known suffix removed.  This avoids guessing unrelated post offices.
+    post_office = _pdf_clean_text(row.get('post_office') or '')
+    upazila_clean = str(row.get('upazila_name') or '').strip()
+    if post_office and upazila_clean:
+        for suffix in ('পুর',):
+            if upazila_clean.endswith(suffix) and post_office == upazila_clean[:-len(suffix)]:
+                row['post_office'] = upazila_clean
+                break
+
     if not str(row.get('ward_no') or '').strip():
         ward = _pdf_meta_pick(source, (
             r'(?:ওয়ার্ড|ওয়ার্ড)\s*(?:নং|নম্বর)\s*(?:[-–—:：]|\([^)]*\))?\s*([0-9০-৯]{1,3})',
