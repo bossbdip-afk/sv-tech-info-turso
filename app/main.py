@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth, credentials
 
-from .parser import parse_pdf_bytes
+from .parser import parse_pdf_bytes, repair_bangla, clean_field
 
 APP_NAME = 'SV Tech Backend V21.3'
 MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
@@ -1232,6 +1232,389 @@ def public_search(district:str='',upazila:str='',name:str='',father:str='',mothe
             'route_cache_hit':route_cache_complete,'databases_queried':len(items_to_query),
             'elapsed_ms':round((time.perf_counter()-started)*1000)}
 
+# PDF preview/upload post-processing.  Keep this deliberately conservative:
+# parser.py remains the source extractor; these helpers only repair text/metadata
+# already present in each parsed row before previewing or writing to Turso.
+_PDF_TEXT_FIELDS = (
+    'name','father_name','mother_name','profession','address','union_name',
+    'post_office','voter_area','district_name','upazila_name','birth_date',
+)
+_PDF_DIGIT_FIELDS = ('voter_no','serial_no','post_code','voter_area_code','ward_no')
+_PDF_LABEL_PREFIXES = {
+    'name': ('নাম',),
+    'father_name': ('পিতা', 'পিতার নাম'),
+    'mother_name': ('মাতা', 'মাতার নাম'),
+    'profession': ('পেশা',),
+    'address': ('ঠিকানা', 'বর্তমান ঠিকানা'),
+    'union_name': ('ইউনিয়ন', 'ইউনিয়ন'),
+    'post_office': ('ডাকঘর',),
+    'post_code': ('পোস্ট কোড', 'পোস্টকোড'),
+    'voter_area': ('ভোটার এলাকার নাম', 'ভোটার এলাকা'),
+    'voter_area_code': ('ভোটার এলাকার নং', 'ভোটার এলাকার নম্বর', 'ভোটার এলাকার কোড'),
+    'ward_no': ('ওয়ার্ড নং', 'ওয়ার্ড নং', 'ওয়ার্ড নম্বর', 'ওয়ার্ড নম্বর'),
+    'district_name': ('জেলা',),
+    'upazila_name': ('উপজেলা', 'থানা'),
+    'birth_date': ('জন্ম তারিখ', 'জন্মতারিখ', 'তারিখ জন্ম'),
+}
+
+# Detect known mojibake/control artifacts before repair_bangla() transforms them.
+# Once transformed, a corrupted token can look like valid Bengali while carrying
+# the wrong letters, so the original extracted value must be checked first.
+_PDF_SUSPICIOUS_RE = re.compile(r'[\x80-\x9FËÎÏÐÑÒÔ×ØÙÚÌåêîïõøúûýÿĀăĐēĔėęĢĤĥĦħĨĩĮįıĲĳĴĽĺļńŇŌŐŘřŜśŝšŞŢŦũŬŮűŽžſƀƁƂƃƄƅƆƎƏƣŨūŋ¢µàŀ◌]')
+
+
+# Conservative repair for PDF extraction that inserts a space inside one
+# Bengali word (for example 'মোহাম্ম দ' or 'সুম ন').  Do not merge normal
+# multi-word names: only a one-codepoint Bengali fragment is auto-joined,
+# plus a tiny allow-list of very common split words seen in voter PDFs.
+_PDF_KNOWN_BROKEN_SPACE_WORDS = {
+    # Only exact, observed voter-PDF splits are auto-repaired.  Generic
+    # one-letter joining is intentionally forbidden because it can mutate
+    # legitimate names (e.g. "আবু ব কর" or "আলী ম").
+    'বে গম': 'বেগম',
+    'মোহাম্ম দ': 'মোহাম্মদ',
+    'মো হাম্মদ': 'মোহাম্মদ',
+    'সুম ন': 'সুমন',
+    'রহি মা': 'রহিমা',
+}
+
+# Ambiguous split shapes that previously triggered a wrong auto-merge.  They
+# are never guessed.  In critical identity fields they make the row unsafe so
+# the original voter identity cannot be silently changed in the database.
+_PDF_AMBIGUOUS_BROKEN_SPACE_RE = re.compile(
+    r'(?:^|\s)(?:আবু\s+ব\s+কর|আলী\s+ম)(?:\s|$)'
+)
+
+def _pdf_repair_broken_spaces(value: str) -> str:
+    x = str(value or '')
+    for broken, fixed in _PDF_KNOWN_BROKEN_SPACE_WORDS.items():
+        x = re.sub(r'(?<![ঀ-৿])' + re.escape(broken) + r'(?![ঀ-৿])', fixed, x)
+    return re.sub(r'\s+', ' ', x).strip()
+
+def _pdf_has_ambiguous_broken_space(value: str) -> bool:
+    return bool(_PDF_AMBIGUOUS_BROKEN_SPACE_RE.search(str(value or '')))
+
+# Common Bengali spellings of Latin-style initials and honorific fragments that
+# may legitimately appear as short standalone tokens in a person's name.  They
+# must not be mistaken for a PDF-inserted internal word break.
+_PDF_ALLOWED_SHORT_IDENTITY_TOKENS = {
+    'এ', 'বি', 'সি', 'ডি', 'ই', 'এফ', 'জি', 'এইচ', 'আই', 'জে', 'কে',
+    'এল', 'এম', 'এন', 'ও', 'পি', 'কিউ', 'আর', 'এস', 'টি', 'ইউ',
+    'ভি', 'এক্স', 'ওয়াই', 'ওয়াই', 'জেড',
+    'মো', 'মোঃ', 'মো:', 'মিঃ', 'ডাঃ', 'আঃ', 'শ্রী',
+}
+
+def _pdf_bengali_base_count(token: str) -> int:
+    # Count Bengali vowel/consonant bases, ignoring dependent vowel signs,
+    # virama and other combining marks.  A split such as 'রহি মা' therefore
+    # treats 'মা' as one base fragment even though it has two code points.
+    return len(re.findall(r'[অ-ঔক-হড়-য়ৎ]', unicodedata.normalize('NFC', str(token or ''))))
+
+def _pdf_short_identity_token(token: str) -> str:
+    return re.sub(r'^[\s.,;:：()\[\]{}\-–—]+|[\s.,;:：()\[\]{}\-–—]+$', '', str(token or '')).strip()
+
+def _pdf_has_unknown_broken_space(value: str) -> bool:
+    """Detect unknown PDF-inserted spaces without guessing a repair.
+
+    After exact known repairs have run, a standalone one-base Bengali fragment
+    next to another Bengali token is highly suspicious in voter-name fields.
+    Legitimate initials/honorifics are allow-listed.  We reject the row rather
+    than concatenate unknown fragments, protecting the original identity.
+    """
+    x = _pdf_repair_broken_spaces(_pdf_clean_text_no_spacing_repair(value))
+    tokens = [t for t in re.split(r'\s+', x) if t]
+    if len(tokens) < 2:
+        return False
+    for i, raw in enumerate(tokens):
+        token = _pdf_short_identity_token(raw)
+        if not token or token in _PDF_ALLOWED_SHORT_IDENTITY_TOKENS:
+            continue
+        if _pdf_bengali_base_count(token) != 1:
+            continue
+        left = _pdf_short_identity_token(tokens[i-1]) if i > 0 else ''
+        right = _pdf_short_identity_token(tokens[i+1]) if i + 1 < len(tokens) else ''
+        left_bases = _pdf_bengali_base_count(left)
+        right_bases = _pdf_bengali_base_count(right)
+        if left_bases >= 2 or right_bases >= 2:
+            return True
+    return False
+
+def _pdf_upload_critical_ok(row: dict) -> bool:
+    # These fields identify the person and are expected on the voter-list PDFs
+    # handled by this backend.  A blank/unsafe value is safer to reject than to
+    # persist as a partial or potentially mis-associated voter record.
+    for field in ('name', 'father_name', 'mother_name'):
+        value = str(row.get(field) or '').strip()
+        if not value or _PDF_SUSPICIOUS_RE.search(value):
+            return False
+    return True
+
+def _pdf_clean_text_no_spacing_repair(value) -> str:
+    x = repair_bangla(str(value or ''))
+    x = clean_field(x)
+    # Legacy extraction sometimes emits chandrabindu before aa-kar.
+    x = x.replace('ঁা', 'াঁ')
+    x = re.sub(r'\s+', ' ', x).strip()
+    return unicodedata.normalize('NFC', x)
+
+def _pdf_clean_text(value) -> str:
+    x = _pdf_clean_text_no_spacing_repair(value)
+    x = _pdf_repair_broken_spaces(x)
+    return unicodedata.normalize('NFC', x)
+
+def _pdf_strip_label(field: str, value: str) -> str:
+    x = str(value or '').strip()
+    # Match the most specific/longest label first.  Otherwise a value such as
+    # 'পিতার নাম: ...' can be partially consumed by the shorter 'পিতা' label.
+    labels = sorted(_PDF_LABEL_PREFIXES.get(field, ()), key=len, reverse=True)
+    for label in labels:
+        updated = re.sub(r'^\s*' + re.escape(label) + r'\s*[:：\-–—]?\s*', '', x, count=1, flags=re.I)
+        if updated != x:
+            x = updated
+            break
+    return x.strip()
+
+def _pdf_normalize_person_prefix(value: str) -> str:
+    x = str(value or '').strip()
+    rules = (
+        (r'^মোসা(?=\s|[:：.ঃ]|$)\s*[:：.ঃ]?\s*', 'মোসাঃ '),
+        (r'^মোসা(?=\s|[:：.ঃ]|$)\s*[:：.ঃ]?\s*', 'মোসাঃ '),
+        (r'^মুহা(?=\s|[:：.ঃ]|$)\s*[:：.ঃ]?\s*', 'মুহাঃ '),
+        (r'^ডা(?=\s|[:：.ঃ]|$)\s*[:：.ঃ]?\s*', 'ডাঃ '),
+        (r'^মো(?=\s|[:：.ঃ]|$)\s*[:：.ঃ]?\s*', 'মোঃ '),
+        (r'^মো(?=\s|[:：.ঃ]|$)\s*[:：.ঃ]?\s*', 'মোঃ '),
+    )
+    for pat, repl in rules:
+        if re.search(pat, x):
+            x = re.sub(pat, repl, x, count=1)
+            break
+    return re.sub(r'\s+', ' ', x).strip()
+
+def _pdf_digits(value: str, first_group: bool = False) -> str:
+    # For compact IDs (voter/serial) separated digit fragments are intentional
+    # and can be joined.  Metadata such as ward/post code must use only one
+    # numeric token; joining every number can turn '৪ ... ২০১০' into '৪২০১০'.
+    groups = re.findall(r'[0-9০-৯]+', str(value or ''))
+    if not groups:
+        return ''
+    return groups[0] if first_group else ''.join(groups)
+
+def _pdf_extract_field_number(field: str, value: str) -> str:
+    src = _pdf_clean_text(value)
+    patterns = {
+        'ward_no': (
+            r'(?:ওয়ার্ড|ওয়ার্ড)\s*(?:নং|নম্বর)?\s*[:：\-]?\s*([0-9০-৯]{1,3})',
+        ),
+        'post_code': (
+            r'পোস্ট\s*কোড\s*[:：\-]?\s*([0-9০-৯]{4,6})',
+        ),
+        'voter_area_code': (
+            r'ভোটার\s*এলাকার\s*(?:নং|নম্বর|কোড)\s*[:：\-]?\s*([0-9০-৯]+)',
+        ),
+    }
+    for pat in patterns.get(field, ()):
+        m = re.search(pat, src, re.I)
+        if m:
+            return _pdf_digits(m.group(1), first_group=True)
+    return _pdf_digits(src, first_group=True)
+
+def _pdf_clean_birth_date(value: str) -> str:
+    src = _pdf_strip_label('birth_date', _pdf_clean_text(value))
+    if not src:
+        return ''
+
+    # Keep a DOB only when it is a real calendar date.  A token that merely
+    # looks date-like (for example 32/15/1990) is unsafe and must not reach DB.
+    m = re.search(r'(?<![0-9০-৯])([0-9০-৯]{1,2}[./\-][0-9০-৯]{1,2}[./\-][0-9০-৯]{4})(?![0-9০-৯])', src)
+    if m:
+        token = m.group(1)
+        ascii_token = token.translate(_BN_TO_ASCII)
+        parts = re.split(r'[./\-]', ascii_token)
+        try:
+            day, month, year = (int(parts[0]), int(parts[1]), int(parts[2]))
+            datetime(year, month, day)
+            if 1900 <= year <= datetime.now().year:
+                return token
+        except Exception:
+            return ''
+
+    # Year-only values are accepted only when the whole cleaned field is that
+    # year and it falls in a plausible range. Otherwise leave the field empty.
+    compact = re.sub(r'\s+', '', src)
+    if re.fullmatch(r'[0-9০-৯]{4}', compact):
+        try:
+            year = int(compact.translate(_BN_TO_ASCII))
+            if 1900 <= year <= datetime.now().year:
+                return compact
+        except Exception:
+            pass
+    return ''
+
+def _pdf_meta_pick(text: str, patterns) -> str:
+    src = _pdf_clean_text(text)
+    for pat in patterns:
+        m = re.search(pat, src, re.I)
+        if m:
+            return _pdf_clean_text(m.group(1))
+    return ''
+
+def _pdf_infer_metadata(row: dict, district: str, upazila: str) -> dict:
+    # Strict record-local inference only. Never use page-level raw/source text
+    # here: one PDF page can contain multiple voters, so a page header/neighbor
+    # number can silently attach the wrong ward/post/area code to this record.
+    source = ' '.join(str(row.get(k) or '') for k in (
+        'address','voter_area','post_office','union_name'
+    ))
+    source = repair_bangla(source)
+
+    row['district_name'] = _pdf_clean_text(row.get('district_name') or district)
+    row['upazila_name'] = _pdf_clean_text(row.get('upazila_name') or upazila)
+
+    if not str(row.get('ward_no') or '').strip():
+        ward = _pdf_meta_pick(source, (
+            r'(?:ওয়ার্ড|ওয়ার্ড)\s*(?:নং|নম্বর)\s*(?:[-–—:：]|\([^)]*\))?\s*([0-9০-৯]{1,3})',
+            r'(?:ওয়াড|ওয়াড)\s*[^0-9০-৯]{0,8}([0-9০-৯]{1,3})',
+        ))
+        if ward:
+            row['ward_no'] = _pdf_digits(ward)
+
+    if not str(row.get('voter_area_code') or '').strip():
+        val = _pdf_meta_pick(source, (
+            r'ভোটার\s*এলাকার\s*(?:নং|নম্বর|কোড)\s*[:：\-]?\s*([0-9০-৯]+)',
+        ))
+        if val:
+            row['voter_area_code'] = _pdf_digits(val)
+
+    if not str(row.get('voter_area') or '').strip():
+        val = _pdf_meta_pick(source, (
+            r'ভোটার\s*এলাকার\s*নাম\s*[:：]\s*(.*?)(?=\s+(?:ভোটার\s*এলাকার|ওয়ার্ড|ওয়ার্ড|ডাকঘর|পোস্ট\s*কোড|$))',
+        ))
+        if val:
+            row['voter_area'] = val
+
+    if not str(row.get('post_code') or '').strip():
+        val = _pdf_meta_pick(source, (r'পোস্ট\s*কোড\s*[:：\-]?\s*([0-9০-৯]{4})',))
+        if val:
+            row['post_code'] = _pdf_digits(val)
+
+    if not str(row.get('post_office') or '').strip():
+        val = _pdf_meta_pick(source, (r'ডাকঘর\s*[:：]\s*(.*?)(?=\s+(?:পোস্ট\s*কোড|ভোটার|ওয়ার্ড|ওয়ার্ড|$))',))
+        if val:
+            row['post_office'] = val
+
+    if not str(row.get('union_name') or '').strip():
+        val = _pdf_meta_pick(source, (r'ইউনিয়ন\s*[:：]\s*(.*?)(?=\s+(?:ডাকঘর|পোস্ট\s*কোড|ভোটার|ওয়ার্ড|ওয়ার্ড|$))',))
+        if val:
+            row['union_name'] = val
+    return row
+
+def sanitize_pdf_record(record: dict, district: str = '', upazila: str = '') -> dict:
+    row = dict(record or {})
+    changed = False
+    unsafe_fields = []
+
+    for field in _PDF_TEXT_FIELDS:
+        old = str(row.get(field) or '')
+        # Apply broken-text safety to every textual voter field, not only
+        # person/address fields. A mojibake district/upazila/union/post office
+        # is still unsafe data and must not reach preview/database output.
+        if field != 'birth_date' and _PDF_SUSPICIOUS_RE.search(old):
+            unsafe_fields.append(field)
+        # Never guess ambiguous internal spacing in identity fields. Exact
+        # known PDF splits are repaired; ambiguous shapes are rejected.
+        if field in ('name','father_name','mother_name') and (
+            _pdf_has_ambiguous_broken_space(old) or _pdf_has_unknown_broken_space(old)
+        ):
+            unsafe_fields.append(field)
+        if field == 'birth_date':
+            new = _pdf_clean_birth_date(old)
+        else:
+            new = _pdf_strip_label(field, _pdf_clean_text(old))
+        if field in ('name','father_name','mother_name'):
+            new = _pdf_normalize_person_prefix(new)
+        if field == 'profession':
+            new = re.sub(r'^(?:গৃহিনী|গৃহীনি|গিহিনী)$', 'গৃহিণী', new)
+        if field == 'address':
+            new = re.sub(r'\s*(?:চূড়ান্ত|চূড়ান্ত|ন্ত)?\s*ভোটার\s*তালিকা\s*', ' ', new)
+            new = re.sub(r'\s*রেজিস্ট্রেশন\s*অফিসার\s*$', '', new)
+            new = re.sub(r'\s*,\s*', ', ', new)
+            new = re.sub(r'\s{2,}', ' ', new).strip(' ,;')
+        if new != old:
+            changed = True
+        row[field] = new
+
+    for field in _PDF_DIGIT_FIELDS:
+        old = str(row.get(field) or '')
+        stripped = _pdf_strip_label(field, _pdf_clean_text(old))
+        if field in ('ward_no','post_code','voter_area_code'):
+            new = _pdf_extract_field_number(field, old)
+        else:
+            new = _pdf_digits(stripped, first_group=False)
+        # Do not erase voter/serial values if a rare parser version stores a
+        # non-numeric key. Other metadata fields are expected to be numeric.
+        if field in ('voter_no','serial_no') and old and not new:
+            new = stripped
+        if new != old:
+            changed = True
+        row[field] = new
+
+    # Clear unsafe text BEFORE metadata inference. Otherwise a broken address
+    # can still donate a plausible-looking ward/post/area number to the record
+    # before the bad text itself is removed later. Form district/upazila values
+    # remain available as trusted fallbacks inside _pdf_infer_metadata().
+    for field in dict.fromkeys(unsafe_fields):
+        if str(row.get(field) or ''):
+            row[field] = ''
+            changed = True
+
+    before_meta = {k: row.get(k,'') for k in ('district_name','upazila_name','union_name','post_office','post_code','voter_area','voter_area_code','ward_no')}
+    row = _pdf_infer_metadata(row, district, upazila)
+    after_meta = {k: row.get(k,'') for k in before_meta}
+    if before_meta != after_meta:
+        changed = True
+
+    # Rebuild the fallback key only if parser could not provide one. Never
+    # change a voter-based key, which protects existing upsert behaviour.
+    if not str(row.get('record_key') or '').strip():
+        voter = str(row.get('voter_no') or '').strip()
+        row['record_key'] = f'v:{voter}' if voter else 's:' + '|'.join(
+            str(row.get(k) or '').strip() for k in ('district_name','upazila_name','source_file','serial_no')
+        )
+        changed = True
+
+    warning_fields = []
+    for field in tuple(f for f in _PDF_TEXT_FIELDS if f != 'birth_date'):
+        value = str(row.get(field) or '')
+        original_unsafe = field in unsafe_fields
+        current_unsafe = bool(_PDF_SUSPICIOUS_RE.search(value))
+        # A broken district/upazila may be replaced above by the trusted form
+        # selection. Preserve that clean fallback while still rejecting any
+        # suspicious value that remains after inference.
+        if current_unsafe or (original_unsafe and field not in ('district_name','upazila_name')):
+            warning_fields.append(field)
+            # Do not preserve visibly corrupted text into preview/upload rows.
+            # Empty is safer than writing fabricated/wrong voter information.
+            row[field] = ''
+            changed = True
+    row['parser_warning_text'] = ','.join(dict.fromkeys(warning_fields))
+    if warning_fields:
+        row['parse_status'] = 'sanitized_broken_text_removed'
+    elif changed and row.get('parse_status') == 'raw_preserved':
+        row['parse_status'] = 'sanitized'
+    elif not row.get('parse_status'):
+        row['parse_status'] = 'clean'
+    row['upload_eligible'] = _pdf_upload_critical_ok(row)
+    if not row['upload_eligible']:
+        existing = [x for x in str(row.get('parser_warning_text') or '').split(',') if x]
+        existing.append('critical_identity_missing')
+        row['parser_warning_text'] = ','.join(dict.fromkeys(existing))
+        row['parse_status'] = 'rejected_critical_missing'
+    row['sanitized_main_py'] = True
+    return row
+
+def sanitize_pdf_rows(rows, district: str = '', upazila: str = ''):
+    return [sanitize_pdf_record(r, district, upazila) for r in (rows or [])]
+
 async def read_pdf(file:UploadFile):
     data=await file.read()
     if not data: raise HTTPException(400,'PDF file খালি')
@@ -1246,10 +1629,11 @@ async def preview(district:str=Form(...),upazila:str=Form(...),file:UploadFile=F
     try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
     except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
+    rows=sanitize_pdf_rows(rows,district,upazila)
     _cache_put(cache_key, rows)
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
     return {'ok':True,'records_detected':len(rows),'raw_preserved':raw,'preview':rows[:20],
-            'parser':'PY-RENDER-V9.6-WARD-UNICODE-FIX','upload_cache_ready':True}
+            'parser':'PY-RENDER-V9.8-MAIN-SANITIZE-PREVIEW','upload_cache_ready':True}
 
 @app.post('/upload')
 async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Form(''),file:UploadFile=File(...),user=Depends(current_user)):
@@ -1262,13 +1646,19 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
         try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
         except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
+    rows=sanitize_pdf_rows(rows,district,upazila)
+    detected_rows = len(rows)
+    rejected_rows = [r for r in rows if not r.get('upload_eligible', True)]
+    rows = [r for r in rows if r.get('upload_eligible', True)]
+    if not rows:
+        raise HTTPException(422,'কোনো নিরাপদ Record পাওয়া যায়নি; নাম/পিতা/মাতার তথ্য অসম্পূর্ণ বা ভাঙা')
     item=get_target(database_id)
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
     now=datetime.now(timezone.utc).isoformat()
-    parser_name='PY-RENDER-V9.6-WARD-UNICODE-UPLOAD-FAST2'
+    parser_name='PY-RENDER-V9.8-MAIN-SANITIZE-UPLOAD'
     import_meta={
         'database_id':item['id'], 'district_name':district, 'upazila_name':upazila,
-        'file_name':file.filename, 'records_detected':len(rows), 'created_at':now,
+        'file_name':file.filename, 'records_detected':detected_rows, 'created_at':now,
         'uploaded_by':user.get('email',''), 'parser':parser_name,
     }
     started=time.perf_counter()
@@ -1284,7 +1674,7 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
         pass
     written=int(write_result['records_written'])
     log={'database_id':item['id'],'database_name':item['name'],'district_name':district,'upazila_name':upazila,
-         'file_name':file.filename,'records_detected':len(rows),'records_written':written,
+         'file_name':file.filename,'records_detected':detected_rows,'records_rejected_unsafe':len(rejected_rows),'records_written':written,
          'batch_commits':write_result['batch_commits'],
          'records_added':write_result['records_added'],'records_updated':write_result['records_updated'],
          'records_unchanged':write_result['records_unchanged'],'records_skipped':write_result['records_skipped'],
