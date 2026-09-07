@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from copy import deepcopy
 
-from anyio import CapacityLimiter, to_process
+from anyio import CapacityLimiter, to_process, to_thread
 from threading import Lock, Thread
 
 import libsql
@@ -1859,10 +1859,52 @@ def _pdf_import_worker(operation, data, district, upazila, filename, item=None, 
             raise ValueError('Unknown PDF import operation')
         timings['worker_seconds'] = round(time.perf_counter() - worker_started, 3)
         result['timings'] = timings
-        result['backend_version'] = '21.19'
+        result['backend_version'] = '21.20'
         return result
     except HTTPException as exc:
         # Explicit error envelope is safe to pickle across worker processes.
+        return {'_pdf_error': {'status_code': exc.status_code, 'detail': exc.detail}}
+
+
+def _pdf_upload_prepared_worker(rows, cache_hit, timings, district, upazila, filename, item, uploaded_by=''):
+    """Write already-prepared Preview rows in process isolation without reparsing the PDF."""
+    worker_started = time.perf_counter()
+    try:
+        raw = sum(1 for r in rows if r.get('parse_status') == 'raw_preserved')
+        flagged = sum(1 for r in rows if not r.get('upload_eligible', True))
+        needs_review = sum(1 for r in rows if r.get('upload_review'))
+        now = datetime.now(timezone.utc).isoformat()
+        parser_name = 'PY-RENDER-V9.8-MAIN-SANITIZE-UPLOAD'
+        meta = {
+            'database_id': item['id'], 'district_name': district, 'upazila_name': upazila,
+            'file_name': filename, 'records_detected': len(rows), 'created_at': now,
+            'uploaded_by': uploaded_by, 'parser': parser_name,
+        }
+        started = time.perf_counter()
+        try:
+            written = write_rows(rows, item, import_meta=meta)
+        except Exception as exc:
+            raise HTTPException(500, f'Turso write failed: {type(exc).__name__}: {exc}') from exc
+        database_seconds = round(time.perf_counter() - started, 3)
+        accounted = written['records_added'] + written['records_updated'] + written['records_unchanged']
+        result = {
+            'ok': True, 'database_id': item['id'], 'database_name': item['name'],
+            'district_name': district, 'upazila_name': upazila, 'file_name': filename,
+            'records_detected': len(rows), 'records_rejected_unsafe': 0,
+            'records_flagged_unsafe': flagged, 'records_needing_review': needs_review,
+            **written, 'records_accounted_unique': accounted,
+            'records_accounted_input': accounted + written['duplicate_input_keys'],
+            'records_added_or_updated': written['records_added'] + written['records_updated'],
+            'raw_preserved': raw, 'created_at': now, 'uploaded_by': uploaded_by,
+            'preview_cache_hit': cache_hit, 'upload_db_seconds': database_seconds,
+            'parser': parser_name, 'backend_version': '21.20',
+        }
+        timings = dict(timings)
+        timings['database_seconds'] = database_seconds
+        timings['worker_seconds'] = round(time.perf_counter() - worker_started, 3)
+        result['timings'] = timings
+        return result
+    except HTTPException as exc:
         return {'_pdf_error': {'status_code': exc.status_code, 'detail': exc.detail}}
 
 
@@ -1870,10 +1912,31 @@ async def _run_pdf_import(operation, data, district, upazila, filename, item=Non
     global _PDF_IMPORT_LIMITER
     if _PDF_IMPORT_LIMITER is None:
         _PDF_IMPORT_LIMITER = CapacityLimiter(PDF_IMPORT_WORKERS)
-    result = await to_process.run_sync(
-        _pdf_import_worker, operation, data, district, upazila, filename, item, uploaded_by,
-        cancellable=False, limiter=_PDF_IMPORT_LIMITER,
-    )
+
+    if operation == 'preview':
+        # V21.20: Preview uses a worker thread. This keeps FastAPI responsive
+        # for normal Python/PDF work AND, critically, stores the sanitized rows
+        # in the serving process cache so the immediately-following Upload can
+        # reuse them. V21.19 used a separate process, whose memory cache was not
+        # shared with the request process.
+        result = await to_thread.run_sync(
+            _pdf_import_worker, operation, data, district, upazila, filename, item, uploaded_by,
+            abandon_on_cancel=False, limiter=_PDF_IMPORT_LIMITER,
+        )
+    else:
+        # Read/prepare in the serving process first. On the normal Preview ->
+        # Upload path this is a cache hit (no PDF parse/sanitize). Pass the exact
+        # prepared rows to an isolated process for synchronous/native DB work so
+        # a libSQL call that holds the GIL cannot block the FastAPI event loop.
+        rows, cache_hit, prep_timings = await to_thread.run_sync(
+            _prepare_pdf_import, data, district, upazila, filename,
+            abandon_on_cancel=False, limiter=_PDF_IMPORT_LIMITER,
+        )
+        result = await to_process.run_sync(
+            _pdf_upload_prepared_worker, rows, cache_hit, prep_timings,
+            district, upazila, filename, item, uploaded_by,
+            cancellable=False, limiter=_PDF_IMPORT_LIMITER,
+        )
     if '_pdf_error' in result:
         error = result['_pdf_error']
         raise HTTPException(error['status_code'], error['detail'])
