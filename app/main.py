@@ -1635,35 +1635,75 @@ async def read_pdf(file:UploadFile):
 
 @app.post('/preview')
 async def preview(district:str=Form(...),upazila:str=Form(...),file:UploadFile=File(...),user=Depends(current_user)):
+    total_started = time.perf_counter()
+    stage_started = total_started
     data=await read_pdf(file)
+    read_seconds = time.perf_counter() - stage_started
     district = district.strip(); upazila = upazila.strip()
+
+    stage_started = time.perf_counter()
     cache_key = _parse_cache_key(data, district, upazila)
+    hash_seconds = time.perf_counter() - stage_started
+
+    stage_started = time.perf_counter()
     try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
     except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
+    parse_seconds = time.perf_counter() - stage_started
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
+
+    stage_started = time.perf_counter()
     rows=sanitize_pdf_rows(rows,district,upazila)
+    sanitize_seconds = time.perf_counter() - stage_started
     _cache_put(cache_key, rows)
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
-    return {'ok':True,'records_detected':len(rows),'raw_preserved':raw,'preview':rows[:20],
-            'parser':'PY-RENDER-V9.8-MAIN-SANITIZE-PREVIEW','upload_cache_ready':True}
+    total_seconds = time.perf_counter() - total_started
+    flagged_unsafe=sum(1 for r in rows if not r.get('upload_eligible', True))
+    return {'ok':True,'records_detected':len(rows),'records_flagged_unsafe':flagged_unsafe,
+            'records_upload_pipeline':len(rows),'raw_preserved':raw,'preview':rows[:20],
+            'parser':'PY-RENDER-V9.8-MAIN-SANITIZE-PREVIEW-CONSISTENT','upload_cache_ready':True,
+            'timings':{'read_seconds':round(read_seconds,3),'hash_seconds':round(hash_seconds,3),
+                       'parse_seconds':round(parse_seconds,3),'sanitize_seconds':round(sanitize_seconds,3),
+                       'total_seconds':round(total_seconds,3)}}
 
 @app.post('/upload')
 async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Form(''),file:UploadFile=File(...),user=Depends(current_user)):
+    total_started = time.perf_counter()
+    stage_started = total_started
     data=await read_pdf(file)
+    read_seconds = time.perf_counter() - stage_started
     district = district.strip(); upazila = upazila.strip()
+
+    stage_started = time.perf_counter()
     cache_key = _parse_cache_key(data, district, upazila)
+    hash_seconds = time.perf_counter() - stage_started
     rows = _cache_get(cache_key)
     cache_hit = rows is not None
+    parse_seconds = 0.0
+    sanitize_seconds = 0.0
     if rows is None:
+        stage_started = time.perf_counter()
         try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
         except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
+        parse_seconds = time.perf_counter() - stage_started
     if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
-    rows=sanitize_pdf_rows(rows,district,upazila)
+
+    # Preview cache stores rows only AFTER sanitization. Re-sanitizing the same
+    # records on an immediate upload is redundant, so skip that CPU work on a
+    # cache hit. A cold/missed cache still follows the exact original sanitize path.
+    if not cache_hit:
+        stage_started = time.perf_counter()
+        rows=sanitize_pdf_rows(rows,district,upazila)
+        sanitize_seconds = time.perf_counter() - stage_started
     detected_rows = len(rows)
-    rejected_rows = [r for r in rows if not r.get('upload_eligible', True)]
-    rows = [r for r in rows if r.get('upload_eligible', True)]
+    # Preview and Upload must account for the exact same parsed rows. Earlier
+    # versions silently removed rows with upload_eligible=False here, which
+    # could make Preview show (for example) 805 while only 798 reached Turso.
+    # Keep the safety flag as an audit warning, but do not drop the row. The
+    # sanitized values already present in the preview cache are what get sent
+    # to write_rows(), preserving Preview -> Upload consistency.
+    flagged_unsafe_rows = [r for r in rows if not r.get('upload_eligible', True)]
     if not rows:
-        raise HTTPException(422,'কোনো নিরাপদ Record পাওয়া যায়নি; নাম/পিতা/মাতার তথ্য অসম্পূর্ণ বা ভাঙা')
+        raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
     item=get_target(database_id)
     raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
     now=datetime.now(timezone.utc).isoformat()
@@ -1677,6 +1717,7 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
     try: write_result=write_rows(rows,item,import_meta=import_meta)
     except Exception as e: raise HTTPException(500,f'Turso write failed: {type(e).__name__}: {e}') from e
     upload_seconds=round(time.perf_counter()-started,3)
+    total_seconds=round(time.perf_counter()-total_started,3)
     _route_add(district, upazila, item['id'])
     # Usage/stats caches are now stale after a successful write. Clear them so
     # the next dashboard refresh is correct without slowing the upload itself.
@@ -1685,14 +1726,21 @@ async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Fo
     except Exception:
         pass
     written=int(write_result['records_written'])
+    accounted_unique=(write_result['records_added']+write_result['records_updated']+write_result['records_unchanged'])
+    accounted_input=accounted_unique+write_result['duplicate_input_keys']
     log={'database_id':item['id'],'database_name':item['name'],'district_name':district,'upazila_name':upazila,
-         'file_name':file.filename,'records_detected':detected_rows,'records_rejected_unsafe':len(rejected_rows),'records_written':written,
+         'file_name':file.filename,'records_detected':detected_rows,
+         'records_rejected_unsafe':0,'records_flagged_unsafe':len(flagged_unsafe_rows),'records_written':written,
          'batch_commits':write_result['batch_commits'],
          'records_added':write_result['records_added'],'records_updated':write_result['records_updated'],
          'records_unchanged':write_result['records_unchanged'],'records_skipped':write_result['records_skipped'],
          'duplicate_input_keys':write_result['duplicate_input_keys'],
+         'records_accounted_unique':accounted_unique,'records_accounted_input':accounted_input,
          'records_added_or_updated':write_result['records_added']+write_result['records_updated'],
          'raw_preserved':raw,'created_at':now,'uploaded_by':user.get('email',''),
          'preview_cache_hit':cache_hit,'upload_db_seconds':upload_seconds,
+         'timings':{'read_seconds':round(read_seconds,3),'hash_seconds':round(hash_seconds,3),
+                    'parse_seconds':round(parse_seconds,3),'sanitize_seconds':round(sanitize_seconds,3),
+                    'database_seconds':upload_seconds,'total_seconds':total_seconds},
          'parser':parser_name}
     return {'ok':True,**log}
