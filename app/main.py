@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from copy import deepcopy
 
-from anyio import CapacityLimiter, to_process, to_thread
+from anyio import CapacityLimiter, to_thread
 from threading import Lock, Thread
 
 import libsql
@@ -582,7 +582,11 @@ def _cache_put(key: str, rows):
         if key not in _PREVIEW_CACHE and len(_PREVIEW_CACHE) >= PREVIEW_CACHE_MAX:
             oldest = min(_PREVIEW_CACHE, key=lambda k: _PREVIEW_CACHE[k].get('ts', 0))
             _PREVIEW_CACHE.pop(oldest, None)
-        _PREVIEW_CACHE[key] = {'ts': now, 'rows': deepcopy(rows)}
+        # V21.21: prepared rows are treated as read-only after sanitizing.
+        # Avoid deep-copying every record (including raw PDF evidence) twice on
+        # Preview -> Upload. Downstream merge/write helpers always copy before
+        # modifying a row, so a shallow tuple snapshot is safe and much cheaper.
+        _PREVIEW_CACHE[key] = {'ts': now, 'rows': tuple(rows)}
 
 
 def _cache_get(key: str):
@@ -593,8 +597,9 @@ def _cache_get(key: str):
         if time.monotonic() - float(item.get('ts', 0)) > PREVIEW_CACHE_TTL:
             _PREVIEW_CACHE.pop(key, None)
             return None
-        # A merge during upload must never change the shared Preview snapshot.
-        return deepcopy(item.get('rows'))
+        # Return a new list container, but reuse immutable/read-only row dicts.
+        # _merge_upload_record/row_params do not mutate these cached dicts.
+        return list(item.get('rows') or ())
 
 ADMIN_EMAILS = {x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
 SKIP_AUTH = os.getenv('SKIP_AUTH', '').lower() in {'1','true','yes'}
@@ -871,7 +876,9 @@ def _merge_upload_record(incoming, previous):
     unsafe re-upload cannot erase the last good display/search column. The
     same merged object feeds SQL columns and data_json so they cannot disagree.
     """
-    merged = deepcopy(incoming)
+    # V21.21: fields are scalar; only upload_review is nested and is deep-copied
+    # below before mutation. Avoid copying large raw PDF strings for every row.
+    merged = dict(incoming)
     preserved = []
     if previous is not None:
         for field in _UPLOAD_CONTENT_FIELDS:
@@ -1399,7 +1406,21 @@ _PDF_LABEL_PREFIXES = {
 # Detect known mojibake/control artifacts before repair_bangla() transforms them.
 # Once transformed, a corrupted token can look like valid Bengali while carrying
 # the wrong letters, so the original extracted value must be checked first.
-_PDF_SUSPICIOUS_RE = re.compile(r'[\x80-\x9FËÎÏÐÑÒÔ×ØÙÚÌåêîïõøúûýÿĀăĐēĔėęĢĤĥĦħĨĩĮįıĲĳĴĽĺļńŇŌŐŘřŜśŝšŞŢŦũŬŮűŽžſƀƁƂƃƄƅƆƎƏƣŨūŋ¢µàŀ◌]')
+_PDF_SUSPICIOUS_RE = re.compile(r'[\x80-\x9FËÎÏÐÑÒÔ×ØÙÚÌåêîïõøúûýÿĀăĐēĔėęĢĤĥĦħĨĩĮįıĲĳĴĽĺļńŇŌŐŘřŔŜśŝšŞŢŦũŬŮűŽžſƀƁƂƃƄƅƆƎƏƣŨūŋ¢µàŀ◌]')
+
+# Exact corruption observed in the user's voter PDF: the legacy conjunct for
+# "শ্চ" is extracted as U+0154 (Ŕ), producing "পিŔম" instead of "পশ্চিম".
+# Repair only this complete, observed token; any other Ŕ remains suspicious and
+# is handled by the existing safety path rather than guessed.
+_PDF_OBSERVED_SAFE_REPAIRS = (
+    (re.compile(r'(?<![ঀ-৿])পি\s*Ŕ\s*ম(?![ঀ-৿])'), 'পশ্চিম'),
+)
+
+def _pdf_repair_observed_legacy(value: str) -> str:
+    x = str(value or '')
+    for pat, repl in _PDF_OBSERVED_SAFE_REPAIRS:
+        x = pat.sub(repl, x)
+    return x
 
 
 # Conservative repair for PDF extraction that inserts a space inside one
@@ -1489,7 +1510,7 @@ def _pdf_upload_critical_ok(row: dict) -> bool:
     return True
 
 def _pdf_clean_text_no_spacing_repair(value) -> str:
-    x = repair_bangla(str(value or ''))
+    x = repair_bangla(_pdf_repair_observed_legacy(str(value or '')))
     x = clean_field(x)
     # Legacy extraction sometimes emits chandrabindu before aa-kar.
     x = x.replace('ঁা', 'াঁ')
@@ -1665,7 +1686,10 @@ def sanitize_pdf_record(record: dict, district: str = '', upazila: str = '') -> 
     unsafe_fields = []
 
     for field in _PDF_TEXT_FIELDS:
-        old = str(row.get(field) or '')
+        source_old = str(row.get(field) or '')
+        old = _pdf_repair_observed_legacy(source_old)
+        if old != source_old:
+            changed = True
         # Apply broken-text safety to every textual voter field, not only
         # person/address fields. A mojibake district/upazila/union/post office
         # is still unsafe data and must not reach preview/database output.
@@ -1859,7 +1883,7 @@ def _pdf_import_worker(operation, data, district, upazila, filename, item=None, 
             raise ValueError('Unknown PDF import operation')
         timings['worker_seconds'] = round(time.perf_counter() - worker_started, 3)
         result['timings'] = timings
-        result['backend_version'] = '21.20'
+        result['backend_version'] = '21.21'
         return result
     except HTTPException as exc:
         # Explicit error envelope is safe to pickle across worker processes.
@@ -1897,7 +1921,7 @@ def _pdf_upload_prepared_worker(rows, cache_hit, timings, district, upazila, fil
             'records_added_or_updated': written['records_added'] + written['records_updated'],
             'raw_preserved': raw, 'created_at': now, 'uploaded_by': uploaded_by,
             'preview_cache_hit': cache_hit, 'upload_db_seconds': database_seconds,
-            'parser': parser_name, 'backend_version': '21.20',
+            'parser': parser_name, 'backend_version': '21.21',
         }
         timings = dict(timings)
         timings['database_seconds'] = database_seconds
@@ -1925,17 +1949,19 @@ async def _run_pdf_import(operation, data, district, upazila, filename, item=Non
         )
     else:
         # Read/prepare in the serving process first. On the normal Preview ->
-        # Upload path this is a cache hit (no PDF parse/sanitize). Pass the exact
-        # prepared rows to an isolated process for synchronous/native DB work so
-        # a libSQL call that holds the GIL cannot block the FastAPI event loop.
+        # Upload path this is a cache hit (no PDF parse/sanitize). V21.21 keeps
+        # the DB work in an AnyIO worker thread instead of crossing a process
+        # boundary and serializing hundreds of large record dictionaries. The
+        # synchronous libSQL network work stays off the event loop, while the
+        # expensive process IPC/startup overhead is removed.
         rows, cache_hit, prep_timings = await to_thread.run_sync(
             _prepare_pdf_import, data, district, upazila, filename,
             abandon_on_cancel=False, limiter=_PDF_IMPORT_LIMITER,
         )
-        result = await to_process.run_sync(
+        result = await to_thread.run_sync(
             _pdf_upload_prepared_worker, rows, cache_hit, prep_timings,
             district, upazila, filename, item, uploaded_by,
-            cancellable=False, limiter=_PDF_IMPORT_LIMITER,
+            abandon_on_cancel=False, limiter=_PDF_IMPORT_LIMITER,
         )
     if '_pdf_error' in result:
         error = result['_pdf_error']
