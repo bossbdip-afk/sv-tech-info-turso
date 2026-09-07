@@ -571,7 +571,7 @@ def _parse_cache_key(data: bytes, district: str, upazila: str, filename: str = '
     return h.hexdigest()
 
 
-def _cache_put(key: str, rows):
+def _cache_put(key: str, rows, context=None):
     if PREVIEW_CACHE_MAX <= 0 or PREVIEW_CACHE_TTL <= 0:
         return
     now = time.monotonic()
@@ -586,7 +586,7 @@ def _cache_put(key: str, rows):
         # Avoid deep-copying every record (including raw PDF evidence) twice on
         # Preview -> Upload. Downstream merge/write helpers always copy before
         # modifying a row, so a shallow tuple snapshot is safe and much cheaper.
-        _PREVIEW_CACHE[key] = {'ts': now, 'rows': tuple(rows)}
+        _PREVIEW_CACHE[key] = {'ts': now, 'rows': tuple(rows), 'context': tuple(context or ())}
 
 
 def _cache_get(key: str):
@@ -601,8 +601,37 @@ def _cache_get(key: str):
         # _merge_upload_record/row_params do not mutate these cached dicts.
         return list(item.get('rows') or ())
 
+def _cache_get_by_token(token: str, district: str, upazila: str, filename: str):
+    """Resolve an opaque Preview token without uploading/hashing the PDF again.
+
+    The token is the SHA-256 cache key generated from PDF bytes + location + filename.
+    It is useful only while the in-memory Preview cache entry exists. Context is
+    checked so a token cannot be replayed for another area or filename.
+    """
+    token = str(token or '').strip()
+    if not re.fullmatch(r'[0-9a-f]{64}', token):
+        return None
+    with _PREVIEW_CACHE_LOCK:
+        item = _PREVIEW_CACHE.get(token)
+        if not item:
+            return None
+        if time.monotonic() - float(item.get('ts', 0)) > PREVIEW_CACHE_TTL:
+            _PREVIEW_CACHE.pop(token, None)
+            return None
+        expected = (str(district or '').strip(), str(upazila or '').strip(), str(filename or ''))
+        if tuple(item.get('context') or ()) != expected:
+            return None
+        return list(item.get('rows') or ())
+
 ADMIN_EMAILS = {x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
 SKIP_AUTH = os.getenv('SKIP_AUTH', '').lower() in {'1','true','yes'}
+# Firebase ID tokens are reused by the admin page across dashboard, Preview and
+# Upload. Verification is deterministic until token expiry, so keep a short
+# in-process cache to avoid repeating certificate/signature work on every API call.
+_AUTH_VERIFY_CACHE = {}
+_AUTH_VERIFY_CACHE_LOCK = Lock()
+_AUTH_VERIFY_CACHE_MAX = 32
+_AUTH_VERIFY_CACHE_TTL = 300
 
 # Firebase is retained ONLY for the existing Admin login/token verification.
 # All application records are stored in Turso; Firestore is not used.
@@ -624,7 +653,7 @@ init_auth_only()
 app = FastAPI(title=APP_NAME, version='21.4.0')
 origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins or ['*'], allow_credentials=False,
-                   allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'])
+                   allow_methods=['GET','POST','DELETE','OPTIONS'], allow_headers=['*'], max_age=86400)
 
 @app.api_route('/', methods=['GET', 'HEAD'], include_in_schema=False)
 def health_root():
@@ -645,13 +674,29 @@ async def current_user(authorization: str | None = Header(default=None)):
         return {'email':'local@test','uid':'local'}
     if not authorization or not authorization.lower().startswith('bearer '):
         raise HTTPException(401, 'Admin login token পাওয়া যায়নি')
+    token = authorization.split(' ',1)[1].strip()
+    cache_key = hashlib.sha256(token.encode()).hexdigest()
+    now_mono = time.monotonic(); now_epoch = time.time()
+    with _AUTH_VERIFY_CACHE_LOCK:
+        cached = _AUTH_VERIFY_CACHE.get(cache_key)
+        if cached and now_mono - cached[0] <= _AUTH_VERIFY_CACHE_TTL:
+            decoded = cached[1]
+            # Never let the local cache extend a Firebase token past exp.
+            if float(decoded.get('exp') or 0) > now_epoch + 5:
+                return decoded
+            _AUTH_VERIFY_CACHE.pop(cache_key, None)
     try:
-        decoded = auth.verify_id_token(authorization.split(' ',1)[1].strip())
+        decoded = auth.verify_id_token(token)
     except Exception as e:
         raise HTTPException(401, 'Admin login token invalid') from e
     email = str(decoded.get('email','')).lower()
     if ADMIN_EMAILS and email not in ADMIN_EMAILS:
         raise HTTPException(403, 'এই account-এর API permission নেই')
+    with _AUTH_VERIFY_CACHE_LOCK:
+        if len(_AUTH_VERIFY_CACHE) >= _AUTH_VERIFY_CACHE_MAX:
+            oldest = min(_AUTH_VERIFY_CACHE, key=lambda k: _AUTH_VERIFY_CACHE[k][0])
+            _AUTH_VERIFY_CACHE.pop(oldest, None)
+        _AUTH_VERIFY_CACHE[cache_key] = (now_mono, decoded)
     return decoded
 
 
@@ -1823,11 +1868,11 @@ def _prepare_pdf_import(data, district, upazila, filename):
                 cleaned['upload_review'] = _upload_review_snapshot(raw_row, cleaned)
         sanitize_seconds = time.perf_counter() - started
         started = time.perf_counter()
-        _cache_put(cache_key, rows)
+        _cache_put(cache_key, rows, (district, upazila, filename))
         cache_seconds += time.perf_counter() - started
     if not rows:
         raise HTTPException(422, 'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
-    return rows, cache_hit, {
+    return rows, cache_hit, cache_key, {
         'hash_seconds': round(hash_seconds, 3), 'cache_seconds': round(cache_seconds, 3),
         'parse_seconds': round(parse_seconds, 3), 'sanitize_seconds': round(sanitize_seconds, 3),
     }
@@ -1837,7 +1882,7 @@ def _pdf_import_worker(operation, data, district, upazila, filename, item=None, 
     """Importable, process-isolated job. No UploadFile/Firebase/DB handle crosses IPC."""
     worker_started = time.perf_counter()
     try:
-        rows, cache_hit, timings = _prepare_pdf_import(data, district, upazila, filename)
+        rows, cache_hit, cache_key, timings = _prepare_pdf_import(data, district, upazila, filename)
         raw = sum(1 for r in rows if r.get('parse_status') == 'raw_preserved')
         flagged = sum(1 for r in rows if not r.get('upload_eligible', True))
         needs_review = sum(1 for r in rows if r.get('upload_review'))
@@ -1848,7 +1893,7 @@ def _pdf_import_worker(operation, data, district, upazila, filename, item=None, 
                 'raw_preserved': raw, 'preview': rows[:20],
                 'parser': 'PY-RENDER-V9.8-MAIN-SANITIZE-PREVIEW-CONSISTENT',
                 'upload_cache_ready': PREVIEW_CACHE_MAX > 0 and PREVIEW_CACHE_TTL > 0,
-                'preview_cache_hit': cache_hit,
+                'preview_cache_hit': cache_hit, 'preview_token': cache_key,
             }
         elif operation == 'upload':
             now = datetime.now(timezone.utc).isoformat()
@@ -1883,7 +1928,7 @@ def _pdf_import_worker(operation, data, district, upazila, filename, item=None, 
             raise ValueError('Unknown PDF import operation')
         timings['worker_seconds'] = round(time.perf_counter() - worker_started, 3)
         result['timings'] = timings
-        result['backend_version'] = '21.21'
+        result['backend_version'] = '21.22'
         return result
     except HTTPException as exc:
         # Explicit error envelope is safe to pickle across worker processes.
@@ -1921,7 +1966,7 @@ def _pdf_upload_prepared_worker(rows, cache_hit, timings, district, upazila, fil
             'records_added_or_updated': written['records_added'] + written['records_updated'],
             'raw_preserved': raw, 'created_at': now, 'uploaded_by': uploaded_by,
             'preview_cache_hit': cache_hit, 'upload_db_seconds': database_seconds,
-            'parser': parser_name, 'backend_version': '21.21',
+            'parser': parser_name, 'backend_version': '21.22',
         }
         timings = dict(timings)
         timings['database_seconds'] = database_seconds
@@ -1931,6 +1976,30 @@ def _pdf_upload_prepared_worker(rows, cache_hit, timings, district, upazila, fil
     except HTTPException as exc:
         return {'_pdf_error': {'status_code': exc.status_code, 'detail': exc.detail}}
 
+
+async def _run_pdf_upload_token(preview_token, district, upazila, filename, item, uploaded_by=''):
+    global _PDF_IMPORT_LIMITER
+    if _PDF_IMPORT_LIMITER is None:
+        _PDF_IMPORT_LIMITER = CapacityLimiter(PDF_IMPORT_WORKERS)
+    started = time.perf_counter()
+    rows = _cache_get_by_token(preview_token, district, upazila, filename)
+    if rows is None:
+        raise HTTPException(409, 'Preview cache expired; PDF আবার পাঠান')
+    prep_timings = {
+        'hash_seconds': 0.0, 'cache_seconds': round(time.perf_counter() - started, 3),
+        'parse_seconds': 0.0, 'sanitize_seconds': 0.0, 'token_cache_hit': True,
+    }
+    result = await to_thread.run_sync(
+        _pdf_upload_prepared_worker, rows, True, prep_timings,
+        district, upazila, filename, item, uploaded_by,
+        abandon_on_cancel=False, limiter=_PDF_IMPORT_LIMITER,
+    )
+    if '_pdf_error' in result:
+        error = result['_pdf_error']
+        raise HTTPException(error['status_code'], error['detail'])
+    result['upload_used_preview_token'] = True
+    result['backend_version'] = '21.22'
+    return result
 
 async def _run_pdf_import(operation, data, district, upazila, filename, item=None, uploaded_by=''):
     global _PDF_IMPORT_LIMITER
@@ -1954,7 +2023,7 @@ async def _run_pdf_import(operation, data, district, upazila, filename, item=Non
         # boundary and serializing hundreds of large record dictionaries. The
         # synchronous libSQL network work stays off the event loop, while the
         # expensive process IPC/startup overhead is removed.
-        rows, cache_hit, prep_timings = await to_thread.run_sync(
+        rows, cache_hit, cache_key, prep_timings = await to_thread.run_sync(
             _prepare_pdf_import, data, district, upazila, filename,
             abandon_on_cancel=False, limiter=_PDF_IMPORT_LIMITER,
         )
@@ -1992,15 +2061,25 @@ async def preview(district:str=Form(...),upazila:str=Form(...),file:UploadFile=F
 
 
 @app.post('/upload')
-async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Form(''),file:UploadFile=File(...),user=Depends(current_user)):
+async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Form(''),
+                 file:UploadFile|None=File(None), preview_token:str=Form(''),
+                 file_name:str=Form(''), user=Depends(current_user)):
     started = time.perf_counter()
-    data = await read_pdf(file)
-    read_seconds = time.perf_counter() - started
     district = district.strip(); upazila = upazila.strip()
     item = get_target(database_id)
     worker_started = time.perf_counter()
-    result = await _run_pdf_import('upload', data, district, upazila, file.filename or '',
-                                   item, user.get('email', ''))
+    if preview_token:
+        filename = str(file_name or (file.filename if file else '') or 'upload.pdf')
+        read_seconds = 0.0
+        result = await _run_pdf_upload_token(preview_token, district, upazila, filename,
+                                             item, user.get('email', ''))
+    else:
+        if file is None:
+            raise HTTPException(400, 'PDF file পাওয়া যায়নি')
+        data = await read_pdf(file)
+        read_seconds = time.perf_counter() - started
+        result = await _run_pdf_import('upload', data, district, upazila, file.filename or '',
+                                       item, user.get('email', ''))
     worker_elapsed = time.perf_counter() - worker_started
     # The write worker has its own memory. Invalidate routing/metrics in the
     # serving process, not just in the child process that performed the write.
