@@ -1,6 +1,9 @@
 import hashlib, json, os, re, time, unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from copy import deepcopy
+
+from anyio import CapacityLimiter, to_process
 from threading import Lock, Thread
 
 import libsql
@@ -20,6 +23,22 @@ MAX_PDF_MB = int(os.getenv('MAX_PDF_MB', '100'))
 PREVIEW_CACHE_TTL = int(os.getenv('PREVIEW_CACHE_TTL_SECONDS', '900'))
 PREVIEW_CACHE_MAX = int(os.getenv('PREVIEW_CACHE_MAX_ITEMS', '6'))
 _PREVIEW_CACHE = {}
+_PREVIEW_CACHE_LOCK = Lock()
+
+# V21.19: isolate PDF/native database work from the ASGI process. PyMuPDF is
+# not thread-safe, and a native synchronous driver can retain the Python GIL.
+# One reusable import worker is the memory-safe default and retains the preview
+# cache between sequential Preview/Upload calls. No live DB handles are shared.
+PDF_IMPORT_WORKERS = max(1, min(4, int(os.getenv('PDF_IMPORT_WORKERS', '1'))))
+_PDF_IMPORT_LIMITER = None  # Created inside the request loop (AnyIO 3/4 compatible).
+_UPLOAD_SCHEMA_READY = set()
+_UPLOAD_SCHEMA_LOCK = Lock()
+_UPLOAD_CONTENT_FIELDS = (
+    'voter_no', 'serial_no', 'name', 'father_name', 'mother_name', 'profession',
+    'birth_date', 'district_name', 'upazila_name', 'address', 'union_name',
+    'post_office', 'post_code', 'voter_area', 'voter_area_code', 'ward_no',
+)
+_UPLOAD_DB_FIELDS = _UPLOAD_CONTENT_FIELDS + ('source_file', 'created_at')
 
 # Search routing cache: (district, upazila) -> configured Turso database ids.
 # It is built in the background and never blocks application startup. If the
@@ -541,34 +560,42 @@ def _start_name_search_index_builder():
     except Exception:
         pass
 
-def _parse_cache_key(data: bytes, district: str, upazila: str) -> str:
-    h = hashlib.sha256()
-    h.update(data)
+def _parse_cache_key(data: bytes, district: str, upazila: str, filename: str = '') -> str:
+    # The parser's source_file AND fallback identity depend on filename. Reuse
+    # only an exact content/location/filename match; never rewrite cached keys.
+    h = hashlib.sha256(data)
+    context = json.dumps([district.strip(), upazila.strip(), filename or ''],
+                         ensure_ascii=False, separators=(',', ':'))
     h.update(b'\0')
-    h.update(district.strip().encode('utf-8'))
-    h.update(b'\0')
-    h.update(upazila.strip().encode('utf-8'))
+    h.update(context.encode('utf-8'))
     return h.hexdigest()
 
+
 def _cache_put(key: str, rows):
-    now = time.time()
-    # Drop stale entries first.
-    for k, item in list(_PREVIEW_CACHE.items()):
-        if now - float(item.get('ts', 0)) > PREVIEW_CACHE_TTL:
-            _PREVIEW_CACHE.pop(k, None)
-    if len(_PREVIEW_CACHE) >= PREVIEW_CACHE_MAX:
-        oldest = min(_PREVIEW_CACHE, key=lambda k: _PREVIEW_CACHE[k].get('ts', 0))
-        _PREVIEW_CACHE.pop(oldest, None)
-    _PREVIEW_CACHE[key] = {'ts': now, 'rows': rows}
+    if PREVIEW_CACHE_MAX <= 0 or PREVIEW_CACHE_TTL <= 0:
+        return
+    now = time.monotonic()
+    with _PREVIEW_CACHE_LOCK:
+        for k, item in list(_PREVIEW_CACHE.items()):
+            if now - float(item.get('ts', 0)) > PREVIEW_CACHE_TTL:
+                _PREVIEW_CACHE.pop(k, None)
+        if key not in _PREVIEW_CACHE and len(_PREVIEW_CACHE) >= PREVIEW_CACHE_MAX:
+            oldest = min(_PREVIEW_CACHE, key=lambda k: _PREVIEW_CACHE[k].get('ts', 0))
+            _PREVIEW_CACHE.pop(oldest, None)
+        _PREVIEW_CACHE[key] = {'ts': now, 'rows': deepcopy(rows)}
+
 
 def _cache_get(key: str):
-    item = _PREVIEW_CACHE.get(key)
-    if not item:
-        return None
-    if time.time() - float(item.get('ts', 0)) > PREVIEW_CACHE_TTL:
-        _PREVIEW_CACHE.pop(key, None)
-        return None
-    return item.get('rows')
+    with _PREVIEW_CACHE_LOCK:
+        item = _PREVIEW_CACHE.get(key)
+        if not item:
+            return None
+        if time.monotonic() - float(item.get('ts', 0)) > PREVIEW_CACHE_TTL:
+            _PREVIEW_CACHE.pop(key, None)
+            return None
+        # A merge during upload must never change the shared Preview snapshot.
+        return deepcopy(item.get('rows'))
+
 ADMIN_EMAILS = {x.strip().lower() for x in os.getenv('ADMIN_EMAILS', '').split(',') if x.strip()}
 SKIP_AUTH = os.getenv('SKIP_AUTH', '').lower() in {'1','true','yes'}
 
@@ -769,102 +796,214 @@ def _comparable_record(row):
     return r
 
 
+def _upload_schema_key(item):
+    # Include the actual target, not just db1/db2 (which may later be remapped).
+    return hashlib.sha256(json.dumps([item.get('id', ''), item.get('url', '')],
+                                    separators=(',', ':')).encode()).hexdigest()
+
+
+def _ensure_upload_schema(conn, item, force=False):
+    key = _upload_schema_key(item)
+    with _UPLOAD_SCHEMA_LOCK:
+        if not force and key in _UPLOAD_SCHEMA_READY:
+            return
+        tables = {str(r[0]) for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('records','pdf_imports')"
+        ).fetchall()}
+        if not {'records', 'pdf_imports'}.issubset(tables):
+            # Reuse the existing schema, unchanged. Do not rebuild FTS indexes
+            # or run schema DDL on every normal upload.
+            ensure_schema(conn)
+        _UPLOAD_SCHEMA_READY.add(key)
+
+
+def _upload_missing_table(exc):
+    return bool(re.search(r'no such table:\s*(?:main\.)?(?:records|pdf_imports)\b',
+                          str(exc), re.I))
+
+
+def _upload_existing_rows(conn, keys):
+    if not keys:
+        return []
+    marks = ','.join('?' for _ in keys)
+    # SQL columns are authoritative even if an older data_json is incomplete.
+    sql = ('SELECT record_key,data_json,' + ','.join(_UPLOAD_DB_FIELDS) +
+           f' FROM records WHERE record_key IN ({marks})')
+    try:
+        return conn.execute(sql, keys).fetchall()
+    except Exception as exc:
+        # Only a rejected oversized statement is split. Never blindly retry
+        # network/commit errors, whose outcome might already be committed.
+        if 'too many sql variables' not in str(exc).lower() or len(keys) <= 1:
+            raise
+        mid = len(keys) // 2
+        return (_upload_existing_rows(conn, keys[:mid]) +
+                _upload_existing_rows(conn, keys[mid:]))
+
+
+def _upload_field_usable(row, field):
+    value = str(row.get(field) or '').strip()
+    if not value or _PDF_SUSPICIOUS_RE.search(value):
+        return False
+    warnings = set(str(row.get('parser_warning_text') or '').split(','))
+    review = row.get('upload_review')
+    preserved = review.get('preserved_fields', []) if isinstance(review, dict) else []
+    # A previous import may carry a warning about an attempted replacement
+    # while its actual field is explicitly marked as preserved/known-good.
+    return field not in warnings or field in preserved
+
+
+def _upload_review_snapshot(raw_row, cleaned_row):
+    return {
+        'status': 'needs_review',
+        'source_file': str(raw_row.get('source_file') or ''),
+        'incoming_fields': {field: raw_row.get(field, '') for field in _UPLOAD_CONTENT_FIELDS},
+        'parser_warning_text': str(cleaned_row.get('parser_warning_text') or ''),
+        'preserved_fields': [],
+    }
+
+
+def _merge_upload_record(incoming, previous):
+    """Preserve valid old fields; keep incoming raw evidence, without guessing.
+
+    No row is discarded. A first-time incomplete row stays flagged, while an
+    unsafe re-upload cannot erase the last good display/search column. The
+    same merged object feeds SQL columns and data_json so they cannot disagree.
+    """
+    merged = deepcopy(incoming)
+    preserved = []
+    if previous is not None:
+        for field in _UPLOAD_CONTENT_FIELDS:
+            if not _upload_field_usable(incoming, field) and _upload_field_usable(previous, field):
+                merged[field] = previous[field]
+                preserved.append(field)
+    if preserved:
+        review = deepcopy(merged.get('upload_review'))
+        if not isinstance(review, dict):
+            # Direct writer callers may only have sanitized rows. Use their
+            # raw_* fields where available; do not reconstruct missing text.
+            raw_row = dict(incoming)
+            for field in _UPLOAD_CONTENT_FIELDS:
+                raw_row[field] = incoming.get('raw_' + field, incoming.get(field, ''))
+            review = _upload_review_snapshot(raw_row, incoming)
+        review['preserved_fields'] = sorted(set(review.get('preserved_fields', []) + preserved))
+        review['status'] = 'needs_review'
+        merged['upload_review'] = review
+    return merged, preserved
+
+
+def _upload_insert_batch(conn, batch):
+    if not batch:
+        return 0
+    columns = 'record_key,' + ','.join(_UPLOAD_DB_FIELDS) + ',data_json'
+    values = ','.join(['(' + ','.join(['?'] * 20) + ')'] * len(batch))
+    update_sql = UPSERT_SQL[UPSERT_SQL.index('ON CONFLICT'):]
+    try:
+        conn.execute(f'INSERT INTO records ({columns}) VALUES {values} {update_sql}',
+                     [value for params in batch for value in params])
+        return 1
+    except Exception as exc:
+        if 'too many sql variables' not in str(exc).lower() or len(batch) <= 1:
+            raise
+        mid = len(batch) // 2
+        return (_upload_insert_batch(conn, batch[:mid]) +
+                _upload_insert_batch(conn, batch[mid:]))
+
+
+def _write_upload_transaction(conn, rows, import_meta):
+    row_by_key = {}
+    duplicate_keys = 0
+    for row in rows:
+        key = safe_record_key(row)
+        if key in row_by_key:
+            duplicate_keys += 1
+            # Even an incomplete later duplicate must not erase a valid value
+            # already seen in this same import. Complete conflicts retain the
+            # existing last-input-wins policy; they are not additional people.
+            row, _ = _merge_upload_record(row, row_by_key[key])
+        row_by_key[key] = row
+
+    keys = list(row_by_key)
+    existing = {}
+    for start in range(0, len(keys), 1500):
+        for db_row in _upload_existing_rows(conn, keys[start:start + 1500]):
+            key, data_json, *values = db_row
+            try:
+                previous = json.loads(data_json or '{}')
+                if not isinstance(previous, dict):
+                    previous = {}
+            except (ValueError, TypeError):
+                previous = {}
+            previous.update(dict(zip(_UPLOAD_DB_FIELDS, values)))
+            existing[str(key)] = previous
+
+    added = updated = unchanged = 0
+    protected_rows = protected_fields = 0
+    to_write = []
+    for key in keys:
+        incoming = row_by_key[key]
+        previous = existing.get(key)
+        merged, protected = _merge_upload_record(incoming, previous)
+        if protected:
+            protected_rows += 1
+            protected_fields += len(protected)
+        if previous is None:
+            added += 1
+        elif _comparable_record(previous) == _comparable_record(merged):
+            unchanged += 1
+            continue
+        else:
+            updated += 1
+        params = row_params(merged)
+        if params[0] != key:
+            raise ValueError('Upload merge changed record identity')
+        to_write.append(params)
+
+    statements = 0
+    for start in range(0, len(to_write), 1500):
+        statements += _upload_insert_batch(conn, to_write[start:start + 1500])
+
+    if import_meta:
+        iid = 'import_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
+        conn.execute(
+            'INSERT INTO pdf_imports(id,database_id,district_name,upazila_name,file_name,records_detected,records_written,created_at,uploaded_by,parser) VALUES (?,?,?,?,?,?,?,?,?,?)',
+            (iid, import_meta.get('database_id', ''), import_meta.get('district_name', ''),
+             import_meta.get('upazila_name', ''), import_meta.get('file_name', ''),
+             int(import_meta.get('records_detected', 0)), added + updated,
+             import_meta.get('created_at', ''), import_meta.get('uploaded_by', ''),
+             import_meta.get('parser', ''))
+        )
+    return {
+        'records_added': added, 'records_updated': updated,
+        'records_unchanged': unchanged, 'records_skipped': 0,
+        'duplicate_input_keys': duplicate_keys, 'records_written': added + updated,
+        'batch_commits': 1, 'record_write_statements': statements,
+        'records_preserved_existing': protected_rows,
+        'fields_preserved_existing': protected_fields,
+    }
+
+
 def write_rows(rows, item, import_meta=None):
-    # The schema already exists for configured Turso databases. Avoid repeating
-    # CREATE TABLE/INDEX checks on every upload; those remote DDL round-trips
-    # were a major part of post-preview upload latency.
     conn = connect_item(item, ensure=False)
     try:
-        # Classify incoming rows before the UPSERT so the Admin Panel can report
-        # exact new / updated / unchanged counts instead of showing 0 for all.
-        params_by_key = {}
-        row_by_key = {}
-        duplicate_keys = 0
-        for row in rows:
-            params = row_params(row)
-            key = params[0]
-            if key in row_by_key:
-                duplicate_keys += 1
-            row_by_key[key] = row
-            params_by_key[key] = params
-
-        keys = list(row_by_key)
-        existing = {}
-        # Keep well below SQLite's host-parameter limit and avoid one remote read
-        # per record.
-        for start in range(0, len(keys), 800):
-            chunk = keys[start:start + 800]
-            if not chunk:
-                continue
-            marks = ','.join('?' for _ in chunk)
-            sql = f'SELECT record_key,data_json FROM records WHERE record_key IN ({marks})'
-            for record_key, data_json in conn.execute(sql, chunk).fetchall():
-                try:
-                    existing[str(record_key)] = json.loads(data_json or '{}')
-                except Exception:
-                    existing[str(record_key)] = {}
-
-        added = updated = unchanged = 0
-        to_write = []
-        for key in keys:
-            incoming = row_by_key[key]
-            previous = existing.get(key)
-            if previous is None:
-                added += 1
-                to_write.append(params_by_key[key])
-            elif _comparable_record(previous) == _comparable_record(incoming):
-                unchanged += 1
-            else:
-                updated += 1
-                to_write.append(params_by_key[key])
-
-        if to_write:
-            # libSQL is remote here. DB-API executemany may still issue many remote
-            # statements, which is very expensive for an 800+ row PDF. Send true
-            # multi-row INSERTs instead. 40 rows x 20 columns = 800 parameters,
-            # safely below SQLite's conservative 999-variable limit.
-            columns = ('record_key,voter_no,serial_no,name,father_name,mother_name,profession,birth_date,'
-                       'district_name,upazila_name,address,union_name,post_office,post_code,voter_area,'
-                       'voter_area_code,ward_no,source_file,created_at,data_json')
-            update_sql = '''ON CONFLICT(record_key) DO UPDATE SET
- voter_no=excluded.voter_no,serial_no=excluded.serial_no,name=excluded.name,father_name=excluded.father_name,
- mother_name=excluded.mother_name,profession=excluded.profession,birth_date=excluded.birth_date,
- district_name=excluded.district_name,upazila_name=excluded.upazila_name,address=excluded.address,
- union_name=excluded.union_name,post_office=excluded.post_office,post_code=excluded.post_code,
- voter_area=excluded.voter_area,voter_area_code=excluded.voter_area_code,ward_no=excluded.ward_no,
- source_file=excluded.source_file,created_at=excluded.created_at,data_json=excluded.data_json'''
-            for start in range(0, len(to_write), 40):
-                batch = to_write[start:start + 40]
-                values_sql = ','.join(['(' + ','.join(['?'] * 20) + ')'] * len(batch))
-                flat = [value for params in batch for value in params]
-                conn.execute(f'INSERT INTO records ({columns}) VALUES {values_sql} {update_sql}', flat)
-
-        # Keep the import audit row in the SAME connection/transaction as the
-        # record write. This removes a second Turso connection + schema check +
-        # commit from every upload.
-        if import_meta:
-            iid='import_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
-            conn.execute(
-                'INSERT INTO pdf_imports(id,database_id,district_name,upazila_name,file_name,records_detected,records_written,created_at,uploaded_by,parser) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                (iid, import_meta.get('database_id',''), import_meta.get('district_name',''),
-                 import_meta.get('upazila_name',''), import_meta.get('file_name',''),
-                 int(import_meta.get('records_detected',0)), added + updated,
-                 import_meta.get('created_at',''), import_meta.get('uploaded_by',''),
-                 import_meta.get('parser',''))
-            )
-
-        if to_write or import_meta:
-            conn.commit()
-
-        return {
-            'records_added': added,
-            'records_updated': updated,
-            'records_unchanged': unchanged,
-            'records_skipped': 0,
-            'duplicate_input_keys': duplicate_keys,
-            'records_written': added + updated,
-            'batch_commits': 1 if to_write else 0,
-        }
+        for attempt in range(2):
+            _ensure_upload_schema(conn, item, force=bool(attempt))
+            try:
+                # Reserve the write transaction before reading old values.
+                # Concurrent imports cannot both merge from stale old data.
+                # Record writes and the import audit entry commit together.
+                conn.execute('BEGIN IMMEDIATE')
+                result = _write_upload_transaction(conn, rows, import_meta)
+                conn.commit()
+                return result
+            except Exception as exc:
+                conn.rollback()
+                if attempt == 0 and _upload_missing_table(exc):
+                    with _UPLOAD_SCHEMA_LOCK:
+                        _UPLOAD_SCHEMA_READY.discard(_upload_schema_key(item))
+                    continue
+                raise
     finally:
         conn.close()
 
@@ -1633,114 +1772,153 @@ async def read_pdf(file:UploadFile):
     if len(data)>MAX_PDF_MB*1024*1024: raise HTTPException(413,f'PDF সর্বোচ্চ {MAX_PDF_MB} MB হতে পারবে')
     return data
 
+def _prepare_pdf_import(data, district, upazila, filename):
+    started = time.perf_counter()
+    cache_key = _parse_cache_key(data, district, upazila, filename)
+    hash_seconds = time.perf_counter() - started
+    started = time.perf_counter()
+    rows = _cache_get(cache_key)
+    cache_seconds = time.perf_counter() - started
+    cache_hit = rows is not None
+    parse_seconds = sanitize_seconds = 0.0
+    if rows is None:
+        started = time.perf_counter()
+        try:
+            parsed = parse_pdf_bytes(data, district, upazila, filename)
+        except Exception as exc:
+            raise HTTPException(422, f'PDF parse করা যায়নি: {exc}') from exc
+        parse_seconds = time.perf_counter() - started
+        if not parsed:
+            raise HTTPException(422, 'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
+        started = time.perf_counter()
+        rows = sanitize_pdf_rows(parsed, district, upazila)
+        for raw_row, cleaned in zip(parsed, rows):
+            # Sanitizer/mapping is unchanged. Save the actual pre-sanitizer
+            # values for review rather than trying to recover them after erase.
+            if not cleaned.get('upload_eligible', True) or cleaned.get('parser_warning_text'):
+                cleaned['upload_review'] = _upload_review_snapshot(raw_row, cleaned)
+        sanitize_seconds = time.perf_counter() - started
+        started = time.perf_counter()
+        _cache_put(cache_key, rows)
+        cache_seconds += time.perf_counter() - started
+    if not rows:
+        raise HTTPException(422, 'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
+    return rows, cache_hit, {
+        'hash_seconds': round(hash_seconds, 3), 'cache_seconds': round(cache_seconds, 3),
+        'parse_seconds': round(parse_seconds, 3), 'sanitize_seconds': round(sanitize_seconds, 3),
+    }
+
+
+def _pdf_import_worker(operation, data, district, upazila, filename, item=None, uploaded_by=''):
+    """Importable, process-isolated job. No UploadFile/Firebase/DB handle crosses IPC."""
+    worker_started = time.perf_counter()
+    try:
+        rows, cache_hit, timings = _prepare_pdf_import(data, district, upazila, filename)
+        raw = sum(1 for r in rows if r.get('parse_status') == 'raw_preserved')
+        flagged = sum(1 for r in rows if not r.get('upload_eligible', True))
+        needs_review = sum(1 for r in rows if r.get('upload_review'))
+        if operation == 'preview':
+            result = {
+                'ok': True, 'records_detected': len(rows), 'records_flagged_unsafe': flagged,
+                'records_needing_review': needs_review, 'records_upload_pipeline': len(rows),
+                'raw_preserved': raw, 'preview': rows[:20],
+                'parser': 'PY-RENDER-V9.8-MAIN-SANITIZE-PREVIEW-CONSISTENT',
+                'upload_cache_ready': PREVIEW_CACHE_MAX > 0 and PREVIEW_CACHE_TTL > 0,
+                'preview_cache_hit': cache_hit,
+            }
+        elif operation == 'upload':
+            now = datetime.now(timezone.utc).isoformat()
+            parser_name = 'PY-RENDER-V9.8-MAIN-SANITIZE-UPLOAD'
+            meta = {
+                'database_id': item['id'], 'district_name': district, 'upazila_name': upazila,
+                'file_name': filename, 'records_detected': len(rows), 'created_at': now,
+                'uploaded_by': uploaded_by, 'parser': parser_name,
+            }
+            started = time.perf_counter()
+            try:
+                written = write_rows(rows, item, import_meta=meta)
+            except Exception as exc:
+                raise HTTPException(500, f'Turso write failed: {type(exc).__name__}: {exc}') from exc
+            database_seconds = round(time.perf_counter() - started, 3)
+            accounted = (written['records_added'] + written['records_updated'] +
+                         written['records_unchanged'])
+            result = {
+                'ok': True, 'database_id': item['id'], 'database_name': item['name'],
+                'district_name': district, 'upazila_name': upazila, 'file_name': filename,
+                'records_detected': len(rows), 'records_rejected_unsafe': 0,
+                'records_flagged_unsafe': flagged, 'records_needing_review': needs_review,
+                **written, 'records_accounted_unique': accounted,
+                'records_accounted_input': accounted + written['duplicate_input_keys'],
+                'records_added_or_updated': written['records_added'] + written['records_updated'],
+                'raw_preserved': raw, 'created_at': now, 'uploaded_by': uploaded_by,
+                'preview_cache_hit': cache_hit, 'upload_db_seconds': database_seconds,
+                'parser': parser_name,
+            }
+            timings['database_seconds'] = database_seconds
+        else:
+            raise ValueError('Unknown PDF import operation')
+        timings['worker_seconds'] = round(time.perf_counter() - worker_started, 3)
+        result['timings'] = timings
+        result['backend_version'] = '21.19'
+        return result
+    except HTTPException as exc:
+        # Explicit error envelope is safe to pickle across worker processes.
+        return {'_pdf_error': {'status_code': exc.status_code, 'detail': exc.detail}}
+
+
+async def _run_pdf_import(operation, data, district, upazila, filename, item=None, uploaded_by=''):
+    global _PDF_IMPORT_LIMITER
+    if _PDF_IMPORT_LIMITER is None:
+        _PDF_IMPORT_LIMITER = CapacityLimiter(PDF_IMPORT_WORKERS)
+    result = await to_process.run_sync(
+        _pdf_import_worker, operation, data, district, upazila, filename, item, uploaded_by,
+        cancellable=False, limiter=_PDF_IMPORT_LIMITER,
+    )
+    if '_pdf_error' in result:
+        error = result['_pdf_error']
+        raise HTTPException(error['status_code'], error['detail'])
+    return result
+
+
+def _pdf_response_timings(result, started, read_seconds, worker_elapsed):
+    timings = result['timings']
+    timings['read_seconds'] = round(read_seconds, 3)
+    timings['worker_wait_ipc_seconds'] = round(max(0.0, worker_elapsed - timings['worker_seconds']), 3)
+    timings['total_seconds'] = round(time.perf_counter() - started, 3)
+    # Authentication, multipart parsing, browser upload, cold start, and response
+    # transfer occur outside this timer. Do not label it end-to-end latency.
+    result['timing_scope'] = 'endpoint_after_auth_and_multipart'
+    return result
+
+
 @app.post('/preview')
 async def preview(district:str=Form(...),upazila:str=Form(...),file:UploadFile=File(...),user=Depends(current_user)):
-    total_started = time.perf_counter()
-    stage_started = total_started
-    data=await read_pdf(file)
-    read_seconds = time.perf_counter() - stage_started
+    started = time.perf_counter()
+    data = await read_pdf(file)
+    read_seconds = time.perf_counter() - started
     district = district.strip(); upazila = upazila.strip()
+    worker_started = time.perf_counter()
+    result = await _run_pdf_import('preview', data, district, upazila, file.filename or '')
+    return _pdf_response_timings(result, started, read_seconds, time.perf_counter() - worker_started)
 
-    stage_started = time.perf_counter()
-    cache_key = _parse_cache_key(data, district, upazila)
-    hash_seconds = time.perf_counter() - stage_started
-
-    stage_started = time.perf_counter()
-    try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
-    except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
-    parse_seconds = time.perf_counter() - stage_started
-    if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
-
-    stage_started = time.perf_counter()
-    rows=sanitize_pdf_rows(rows,district,upazila)
-    sanitize_seconds = time.perf_counter() - stage_started
-    _cache_put(cache_key, rows)
-    raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
-    total_seconds = time.perf_counter() - total_started
-    flagged_unsafe=sum(1 for r in rows if not r.get('upload_eligible', True))
-    return {'ok':True,'records_detected':len(rows),'records_flagged_unsafe':flagged_unsafe,
-            'records_upload_pipeline':len(rows),'raw_preserved':raw,'preview':rows[:20],
-            'parser':'PY-RENDER-V9.8-MAIN-SANITIZE-PREVIEW-CONSISTENT','upload_cache_ready':True,
-            'timings':{'read_seconds':round(read_seconds,3),'hash_seconds':round(hash_seconds,3),
-                       'parse_seconds':round(parse_seconds,3),'sanitize_seconds':round(sanitize_seconds,3),
-                       'total_seconds':round(total_seconds,3)}}
 
 @app.post('/upload')
 async def upload(district:str=Form(...),upazila:str=Form(...),database_id:str=Form(''),file:UploadFile=File(...),user=Depends(current_user)):
-    total_started = time.perf_counter()
-    stage_started = total_started
-    data=await read_pdf(file)
-    read_seconds = time.perf_counter() - stage_started
+    started = time.perf_counter()
+    data = await read_pdf(file)
+    read_seconds = time.perf_counter() - started
     district = district.strip(); upazila = upazila.strip()
-
-    stage_started = time.perf_counter()
-    cache_key = _parse_cache_key(data, district, upazila)
-    hash_seconds = time.perf_counter() - stage_started
-    rows = _cache_get(cache_key)
-    cache_hit = rows is not None
-    parse_seconds = 0.0
-    sanitize_seconds = 0.0
-    if rows is None:
-        stage_started = time.perf_counter()
-        try: rows=parse_pdf_bytes(data,district,upazila,file.filename)
-        except Exception as e: raise HTTPException(422,f'PDF parse করা যায়নি: {e}') from e
-        parse_seconds = time.perf_counter() - stage_started
-    if not rows: raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
-
-    # Preview cache stores rows only AFTER sanitization. Re-sanitizing the same
-    # records on an immediate upload is redundant, so skip that CPU work on a
-    # cache hit. A cold/missed cache still follows the exact original sanitize path.
-    if not cache_hit:
-        stage_started = time.perf_counter()
-        rows=sanitize_pdf_rows(rows,district,upazila)
-        sanitize_seconds = time.perf_counter() - stage_started
-    detected_rows = len(rows)
-    # Preview and Upload must account for the exact same parsed rows. Earlier
-    # versions silently removed rows with upload_eligible=False here, which
-    # could make Preview show (for example) 805 while only 798 reached Turso.
-    # Keep the safety flag as an audit warning, but do not drop the row. The
-    # sanitized values already present in the preview cache are what get sent
-    # to write_rows(), preserving Preview -> Upload consistency.
-    flagged_unsafe_rows = [r for r in rows if not r.get('upload_eligible', True)]
-    if not rows:
-        raise HTTPException(422,'PDF থেকে কোনো Record শনাক্ত করা যায়নি')
-    item=get_target(database_id)
-    raw=sum(1 for r in rows if r.get('parse_status')=='raw_preserved')
-    now=datetime.now(timezone.utc).isoformat()
-    parser_name='PY-RENDER-V9.8-MAIN-SANITIZE-UPLOAD'
-    import_meta={
-        'database_id':item['id'], 'district_name':district, 'upazila_name':upazila,
-        'file_name':file.filename, 'records_detected':detected_rows, 'created_at':now,
-        'uploaded_by':user.get('email',''), 'parser':parser_name,
-    }
-    started=time.perf_counter()
-    try: write_result=write_rows(rows,item,import_meta=import_meta)
-    except Exception as e: raise HTTPException(500,f'Turso write failed: {type(e).__name__}: {e}') from e
-    upload_seconds=round(time.perf_counter()-started,3)
-    total_seconds=round(time.perf_counter()-total_started,3)
+    item = get_target(database_id)
+    worker_started = time.perf_counter()
+    result = await _run_pdf_import('upload', data, district, upazila, file.filename or '',
+                                   item, user.get('email', ''))
+    worker_elapsed = time.perf_counter() - worker_started
+    # The write worker has its own memory. Invalidate routing/metrics in the
+    # serving process, not just in the child process that performed the write.
     _route_add(district, upazila, item['id'])
-    # Usage/stats caches are now stale after a successful write. Clear them so
-    # the next dashboard refresh is correct without slowing the upload itself.
     try:
         _fast_cache_clear()
     except Exception:
         pass
-    written=int(write_result['records_written'])
-    accounted_unique=(write_result['records_added']+write_result['records_updated']+write_result['records_unchanged'])
-    accounted_input=accounted_unique+write_result['duplicate_input_keys']
-    log={'database_id':item['id'],'database_name':item['name'],'district_name':district,'upazila_name':upazila,
-         'file_name':file.filename,'records_detected':detected_rows,
-         'records_rejected_unsafe':0,'records_flagged_unsafe':len(flagged_unsafe_rows),'records_written':written,
-         'batch_commits':write_result['batch_commits'],
-         'records_added':write_result['records_added'],'records_updated':write_result['records_updated'],
-         'records_unchanged':write_result['records_unchanged'],'records_skipped':write_result['records_skipped'],
-         'duplicate_input_keys':write_result['duplicate_input_keys'],
-         'records_accounted_unique':accounted_unique,'records_accounted_input':accounted_input,
-         'records_added_or_updated':write_result['records_added']+write_result['records_updated'],
-         'raw_preserved':raw,'created_at':now,'uploaded_by':user.get('email',''),
-         'preview_cache_hit':cache_hit,'upload_db_seconds':upload_seconds,
-         'timings':{'read_seconds':round(read_seconds,3),'hash_seconds':round(hash_seconds,3),
-                    'parse_seconds':round(parse_seconds,3),'sanitize_seconds':round(sanitize_seconds,3),
-                    'database_seconds':upload_seconds,'total_seconds':total_seconds},
-         'parser':parser_name}
-    return {'ok':True,**log}
+    return _pdf_response_timings(result, started, read_seconds, worker_elapsed)
+
